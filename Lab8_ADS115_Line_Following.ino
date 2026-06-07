@@ -353,9 +353,9 @@ void PID_Control()
         // 直角弯专用: 高Kp快速打方向
         //              小Ki维持转弯姿态不丢线
         //              高Kd抑制过冲防摆头
-        currentKp  = 0.15;   // 原0.45 → 适中响应，够转且不过冲
+        currentKp  = 0.25;   // 原0.45 → 适中响应，够转且不过冲
         currentKi  = 0.04;   // 原0.00 → 帮助维持转弯
-        currentKd  = 4.0;    // 原2.50 → 适度阻尼，兼顾速度与平稳
+        currentKd  = 10.0;    // 原2.50 → 适度阻尼，兼顾速度与平稳
 
         currentBaseSpeed = 35;
     }
