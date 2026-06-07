@@ -3,271 +3,225 @@
 
 ADS1115_WE ads = ADS1115_WE(0x48);
 
-/*
-====================================================
-电机PWM引脚
-====================================================
-*/
-int enablePin1 = 10;
-int enablePin2 = 9;
+// ====================================================
+// 调试开关（注释掉关闭串口输出）
+// ====================================================
+#define DEBUG_SERIAL
 
-/*
-====================================================
-电机方向引脚
-====================================================
-*/
-int in1Pin = 4;
-int in2Pin = 5;
+// ====================================================
+// 电机PWM引脚
+// ====================================================
+const int enablePin1 = 10;
+const int enablePin2 = 9;
 
-int in3Pin = 3;
-int in4Pin = 2;
+// ====================================================
+// 电机方向引脚
+// ====================================================
+const int in1Pin = 4;
+const int in2Pin = 5;
+const int in3Pin = 2;
+const int in4Pin = 3;
 
-/*
-====================================================
-ADS1115阈值
-首次运行请观察串口再调整
-====================================================
-*/
-int thresholds[3] =
-{
+// ====================================================
+// ADS1115阈值
+// ====================================================
+const int thresholds[3] = {
     12700,  // 左: 白~6500 / 黑~18890
     9785,   // 中: 白~1350 / 黑~18220
     11255   // 右: 白~5260 / 黑~17250
 };
 
-/*
-====================================================
-传感器状态
-====================================================
-*/
+// ====================================================
+// 传感器状态
+// ====================================================
 int irSensorDigital[3];
 int irSensors = B000;
 
-/*
-====================================================
-基础速度
-====================================================
-*/
-int baseSpeed = 80;
+// ====================================================
+// 基础速度
+// ====================================================
+const int baseSpeed = 90;
 
-/*
-====================================================
-PID参数
-====================================================
-*/
-float Kp = 0.45;
-float Ki = 0.00;
-float Kd = 2.5;
+// ====================================================
+// 死区阈值
+// ====================================================
+const int deadband = 15;
 
-/*
-====================================================
-PID变量
-====================================================
-*/
+// ====================================================
+// 正常模式PID参数
+// ====================================================
+const float Kp_normal = 0.45;
+const float Ki_normal = 0.00;
+const float Kd_normal = 2.5;
+
+// ====================================================
+// 直角弯PID参数
+// ====================================================
+const float Kp_sharp = 0.15;
+const float Ki_sharp = 0.04;
+const float Kd_sharp = 4.0;
+
+// ====================================================
+// PID变量
+// ====================================================
 float error = 0;
 float lastError = 0;
-
 float integral = 0;
 float derivative = 0;
-
 float pid = 0;
 
-/*
-====================================================
-电机速度
-====================================================
-*/
+// ====================================================
+// 直角弯状态锁存
+// ====================================================
+bool turningHard = false;
+
+// ====================================================
+// 电机速度
+// ====================================================
 int leftMotorSpeed = 0;
 int rightMotorSpeed = 0;
 
-/*
-====================================================
-读取ADS1115通道
-====================================================
-*/
-int readADS(byte ch)
-{
-    switch(ch)
-    {
-        case 0:
-            ads.setCompareChannels(ADS1115_COMP_0_GND);
-            break;
-
-        case 1:
-            ads.setCompareChannels(ADS1115_COMP_1_GND);
-            break;
-
-        case 2:
-            ads.setCompareChannels(ADS1115_COMP_2_GND);
-            break;
-    }
-
+// ====================================================
+// 读取ADS1115通道（使用静态数组优化）
+// ====================================================
+int readADS(byte ch) {
+    static const ADS1115_MUX channels[3] = {
+        ADS1115_COMP_0_GND,  // 通道0
+        ADS1115_COMP_1_GND,  // 通道1
+        ADS1115_COMP_2_GND   // 通道2
+    };
+    
+    ads.setCompareChannels(channels[ch]);
     ads.startSingleMeasurement();
-
-    while(ads.isBusy())
-    {
-    }
-
+    while(ads.isBusy()) {}
     return ads.getRawResult();
 }
 
-/*
-====================================================
-初始化
-====================================================
-*/
-void setup()
-{
+// ====================================================
+// 初始化
+// ====================================================
+void setup() {
+    #ifdef DEBUG_SERIAL
     Serial.begin(115200);
+    #endif
 
     pinMode(enablePin1, OUTPUT);
     pinMode(enablePin2, OUTPUT);
-
     pinMode(in1Pin, OUTPUT);
     pinMode(in2Pin, OUTPUT);
-
     pinMode(in3Pin, OUTPUT);
     pinMode(in4Pin, OUTPUT);
 
     Wire.begin();
 
-    if(!ads.init())
-    {
+    if(!ads.init()) {
+        #ifdef DEBUG_SERIAL
         Serial.println("ADS1115 ERROR");
+        #endif
         while(1);
     }
 
     ads.setVoltageRange_mV(ADS1115_RANGE_6144);
     ads.setConvRate(ADS1115_860_SPS);
 
+    #ifdef DEBUG_SERIAL
     Serial.println("ADS1115 READY");
+    #endif
+
+    // 初始化电机为刹车状态
+    StopMotors();
 }
 
-/*
-====================================================
-主循环
-====================================================
-*/
-void loop()
-{
+// ====================================================
+// 主循环
+// ====================================================
+void loop() {
     Scan();
-
     CalculateError();
-
     PID_Control();
-
     Drive(leftMotorSpeed, rightMotorSpeed);
-
-    delay(2);
 }
 
-/*
-====================================================
-扫描红外
-====================================================
-*/
-void Scan()
-{
+// ====================================================
+// 扫描红外传感器
+// ====================================================
+void Scan() {
     irSensors = B000;
 
-    /*
-        传感器通道映射:
-        ADS A2 ← 原Arduino A5 → 左传感器
-        ADS A1 ← 原Arduino A4 → 中间传感器
-        ADS A0 ← 原Arduino A3 → 右传感器
-
-        raw数组: 左 中 右
-    */
+    // 传感器通道映射:
+    // ADS A2 ← 左传感器
+    // ADS A1 ← 中间传感器
+    // ADS A0 ← 右传感器
     int rawLeft  = readADS(2);
     int rawMid   = readADS(1);
     int rawRight = readADS(0);
 
     int raw[3] = {rawLeft, rawMid, rawRight};
 
-    for(int i=0;i<3;i++)
-    {
-        if(raw[i] >= thresholds[i])
-        {
-            irSensorDigital[i] = 1;
-        }
-        else
-        {
-            irSensorDigital[i] = 0;
-        }
-
-        int b = 2 - i;
-
-        irSensors +=
-        (
-            irSensorDigital[i] << b
-        );
+    for(int i = 0; i < 3; i++) {
+        irSensorDigital[i] = (raw[i] >= thresholds[i]) ? 1 : 0;
+        irSensors |= (irSensorDigital[i] << (2 - i));
     }
 
-    Serial.print("L=");
-    Serial.print(rawLeft);
-
-    Serial.print(" M=");
-    Serial.print(rawMid);
-
-    Serial.print(" R=");
-    Serial.print(rawRight);
-
-    Serial.print(" STATE=B");
-    Serial.print(irSensors, BIN);
-
-    Serial.print(" ERR=");
-    Serial.print(error);
-
-    Serial.print(" LSPD=");
-    Serial.print(leftMotorSpeed);
-
-    Serial.print(" RSPD=");
-    Serial.println(rightMotorSpeed);
+    // 定时输出调试信息（每80ms一次）
+    #ifdef DEBUG_SERIAL
+    static unsigned long lastPrint = 0;
+    if(millis() - lastPrint > 80) {
+        Serial.print("L=");
+        Serial.print(rawLeft);
+        Serial.print(" M=");
+        Serial.print(rawMid);
+        Serial.print(" R=");
+        Serial.print(rawRight);
+        Serial.print(" S=B");
+        Serial.print(irSensors, BIN);
+        Serial.print(" E=");
+        Serial.print(error);
+        Serial.print(" LSPD=");
+        Serial.print(leftMotorSpeed);
+        Serial.print(" RSPD=");
+        Serial.print(rightMotorSpeed);
+        Serial.print(" T=");
+        Serial.println(turningHard ? "HARD" : "NORM");
+        lastPrint = millis();
+    }
+    #endif
 }
 
-/*
-====================================================
-状态转误差
-====================================================
-*/
-void CalculateError()
-{
-    switch(irSensors)
-    {
-        case B010:
+// ====================================================
+// 状态转误差
+// ====================================================
+void CalculateError() {
+    switch(irSensors) {
+        case B010:  // 中间看到线
             error = 0;
             break;
 
-        case B110:
+        case B110:  // 左+中看到线
             error = -40;
             break;
 
-        case B100:
+        case B100:  // 仅左看到线
             error = -80;
             break;
 
-        case B011:
+        case B011:  // 中+右看到线
             error = 40;
             break;
 
-        case B001:
+        case B001:  // 仅右看到线
             error = 80;
             break;
 
-        case B000:
-
-            if(lastError < 0)
-            {
+        case B000:  // 完全丢线
+            if(lastError < 0) {
                 error = -110;
-            }
-            else
-            {
+            } else {
                 error = 110;
             }
-
             break;
 
-        case B111:
+        case B111:  // 全部看到线（十字路口等）
             error = 0;
             break;
 
@@ -276,149 +230,135 @@ void CalculateError()
     }
 }
 
-/*
-====================================================
-PID
-====================================================
-*/
-void PID_Control()
-{
+// ====================================================
+// PID控制
+// ====================================================
+void PID_Control() {
     derivative = error - lastError;
 
     // ============================================
-    // 直角弯检测
+    // 直角弯检测与状态锁存
     // ============================================
-    //
-    // 条件1: 只有最外侧传感器看到线 →
-    //         B100(仅左) 或 B001(仅右)
-    //         这是进入直角弯的最可靠信号
-    //
-    // 条件2: 完全丢线 B000 且之前在大误差 →
-    //         直角弯中途暂时丢线, 按原方向继续转
-    //
-    bool isSharpTurn =
-    (
-        irSensors == B100 ||
-        irSensors == B001
-    );
+    bool isSharpTurn = (irSensors == B100 || irSensors == B001);
+    bool isLostInTurn = (irSensors == B000 && abs(lastError) >= 80);
 
-    bool isLostInTurn =
-    (
-        irSensors == B000 &&
-        abs(lastError) >= 80
-    );
-
-    bool useSharpPID =
-    (
-        isSharpTurn ||
-        isLostInTurn
-    );
-
-    // ============================================
-    // 切换时重置积分, 避免历史积分污染
-    // ============================================
-    static bool wasSharpLastLoop = false;
-
-    if(useSharpPID != wasSharpLastLoop)
-    {
-        integral = 0;
+    if(isSharpTurn) {
+        turningHard = true;  // 进入直角弯
+    } else if(irSensors == B010 || irSensors == B111) {
+        turningHard = false;  // 回到中线，退出直角弯
     }
 
+    bool useSharpPID = turningHard || isLostInTurn;
+
+    // ============================================
+    // 模式切换时重置积分
+    // ============================================
+    static bool wasSharpLastLoop = false;
+    if(useSharpPID != wasSharpLastLoop) {
+        integral = 0;
+    }
     wasSharpLastLoop = useSharpPID;
 
     // ============================================
-    // 积分累加 (只在直角弯模式中启用 Ki)
+    // 积分累加（仅在直角弯或小误差时）
     // ============================================
-    if(useSharpPID)
-    {
+    if(useSharpPID || abs(error) < 60) {
         integral += error;
+    } else {
+        integral = 0;  // 大误差时清零积分，防止积分饱和
     }
 
-    integral =
-    constrain
-    (
-        integral,
-        -300,
-        300
-    );
+    integral = constrain(integral, -300, 300);
 
     // ============================================
-    // 双套 PID 参数
+    // 选择PID参数与基础速度
     // ============================================
     float currentKp, currentKi, currentKd;
-    int   currentBaseSpeed;
+    int currentBaseSpeed;
 
-    if(useSharpPID)
-    {
-        // 直角弯专用: 高Kp快速打方向
-        //              小Ki维持转弯姿态不丢线
-        //              高Kd抑制过冲防摆头
-        currentKp  = 0.25;   // 原0.45 → 适中响应，够转且不过冲
-        currentKi  = 0.04;   // 原0.00 → 帮助维持转弯
-        currentKd  = 10.0;    // 原2.50 → 适度阻尼，兼顾速度与平稳
-
+    if(useSharpPID) {
+        currentKp = Kp_sharp;
+        currentKi = Ki_sharp;
+        currentKd = Kd_sharp;
         currentBaseSpeed = 35;
-    }
-    else
-    {
-        // 正常 PID
-        currentKp  = Kp;
-        currentKi  = Ki;
-        currentKd  = Kd;
+    } else {
+        currentKp = Kp_normal;
+        currentKi = Ki_normal;
+        currentKd = Kd_normal;
 
-        // 阶梯降速策略
-        if(abs(error) >= 110)       // 完全丢线，最慢
-        {
-            currentBaseSpeed = 30;
-        }
-        else if(abs(error) >= 40)   // 一般弯道
-        {
-            currentBaseSpeed = 55;
-        }
-        else                        // 直线
-        {
-            currentBaseSpeed = baseSpeed;  // 70
+        // 根据误差调整基础速度
+        int absErr = abs(error);
+        if(absErr >= 110) {
+            currentBaseSpeed = 30;  // 完全丢线
+        } else if(absErr >= 40) {
+            currentBaseSpeed = 55;  // 一般弯道
+        } else {
+            currentBaseSpeed = baseSpeed;  // 直线
         }
     }
 
-    pid =
-    currentKp  * error +
-    currentKi  * integral +
-    currentKd  * derivative;
-
+    // ============================================
+    // 计算PID输出
+    // ============================================
+    pid = currentKp * error + currentKi * integral + currentKd * derivative;
     lastError = error;
 
-    leftMotorSpeed =
-    constrain
-    (
-        currentBaseSpeed + pid,
-        0,
-        255
-    );
-
-    rightMotorSpeed =
-    constrain
-    (
-        currentBaseSpeed - pid,
-        0,
-        255
-    );
+    // ============================================
+    // 计算电机速度
+    // ============================================
+    leftMotorSpeed = constrain(currentBaseSpeed + pid, -255, 255);
+    rightMotorSpeed = constrain(currentBaseSpeed - pid, -255, 255);
 }
 
-/*
-====================================================
-驱动
-====================================================
-*/
-void Drive(int leftSpeed,int rightSpeed)
-{
-    analogWrite(enablePin1,rightSpeed);
+// ====================================================
+// 驱动电机（带死区与刹车）
+// ====================================================
+void Drive(int leftSpeed, int rightSpeed) {
+    // 右电机 (enablePin1, in1Pin, in2Pin)
+    if(abs(rightSpeed) < deadband) {
+        // 刹车
+        digitalWrite(in1Pin, LOW);
+        digitalWrite(in2Pin, LOW);
+        analogWrite(enablePin1, 0);
+    } else if(rightSpeed > 0) {
+        // 正转
+        digitalWrite(in1Pin, HIGH);
+        digitalWrite(in2Pin, LOW);
+        analogWrite(enablePin1, rightSpeed);
+    } else {
+        // 反转
+        digitalWrite(in1Pin, LOW);
+        digitalWrite(in2Pin, HIGH);
+        analogWrite(enablePin1, -rightSpeed);
+    }
 
-    digitalWrite(in1Pin,HIGH);
-    digitalWrite(in2Pin,LOW);
+    // 左电机 (enablePin2, in3Pin, in4Pin)
+    if(abs(leftSpeed) < deadband) {
+        // 刹车
+        digitalWrite(in3Pin, LOW);
+        digitalWrite(in4Pin, LOW);
+        analogWrite(enablePin2, 0);
+    } else if(leftSpeed > 0) {
+        // 正转
+        digitalWrite(in3Pin, HIGH);
+        digitalWrite(in4Pin, LOW);
+        analogWrite(enablePin2, leftSpeed);
+    } else {
+        // 反转
+        digitalWrite(in3Pin, LOW);
+        digitalWrite(in4Pin, HIGH);
+        analogWrite(enablePin2, -leftSpeed);
+    }
+}
 
-    analogWrite(enablePin2,leftSpeed);
-
-    digitalWrite(in3Pin,LOW);
-    digitalWrite(in4Pin,HIGH);
+// ====================================================
+// 停止电机
+// ====================================================
+void StopMotors() {
+    digitalWrite(in1Pin, LOW);
+    digitalWrite(in2Pin, LOW);
+    digitalWrite(in3Pin, LOW);
+    digitalWrite(in4Pin, LOW);
+    analogWrite(enablePin1, 0);
+    analogWrite(enablePin2, 0);
 }
