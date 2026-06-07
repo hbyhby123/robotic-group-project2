@@ -1,13 +1,13 @@
 // ==================== 电机引脚测试代码（修复版） ====================
 
 // 引脚定义
-const int enablePin1 = 10;  // 左电机速度 PWM
-const int enablePin2 = 9;   // 右电机速度 PWM
+const int enablePin1 = 9;  // 左电机速度 PWM
+const int enablePin2 = 10;   // 右电机速度 PWM
 
-const int in1Pin = 4;       // 左电机方向引脚1
-const int in2Pin = 5;       // 左电机方向引脚2
-const int in3Pin = 2;       // 右电机方向引脚1
-const int in4Pin = 3;       // 右电机方向引脚2
+const int in1Pin = 2;       // 左电机方向引脚1
+const int in2Pin = 3;       // 左电机方向引脚2
+const int in3Pin = 4;       // 右电机方向引脚1
+const int in4Pin = 5;       // 右电机方向引脚2
 
 void setup() {
   Serial.begin(115200);
