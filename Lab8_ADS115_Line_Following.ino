@@ -305,13 +305,24 @@ void PID_Control()
 
     int currentBaseSpeed;
 
-    if(abs(error) >= 80)
+    // ============================================
+    // 阶梯降速策略
+    // ============================================
+    if(abs(error) >= 110)       // 完全丢线，最慢
     {
-        currentBaseSpeed = 45;
+        currentBaseSpeed = 30;
     }
-    else
+    else if(abs(error) >= 80)   // 直角弯
     {
-        currentBaseSpeed = baseSpeed;
+        currentBaseSpeed = 35;
+    }
+    else if(abs(error) >= 40)   // 一般弯道
+    {
+        currentBaseSpeed = 55;
+    }
+    else                        // 直线
+    {
+        currentBaseSpeed = baseSpeed;  // 70
     }
 
     leftMotorSpeed =
