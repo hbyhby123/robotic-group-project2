@@ -45,7 +45,7 @@ const int baseSpeed = 90;
 // ====================================================
 // 死区阈值
 // ====================================================
-const int deadband = 15;
+const int deadband = 8;
 
 // ====================================================
 // 正常模式PID参数
@@ -57,9 +57,9 @@ const float Kd_normal = 2.5;
 // ====================================================
 // 直角弯PID参数
 // ====================================================
-const float Kp_sharp = 0.15;
-const float Ki_sharp = 0.04;
-const float Kd_sharp = 4.0;
+const float Kp_sharp = 0.25;
+const float Ki_sharp = 0.02;
+const float Kd_sharp = 1.5;
 
 // ====================================================
 // PID变量
@@ -74,6 +74,7 @@ float pid = 0;
 // 直角弯状态锁存
 // ====================================================
 bool turningHard = false;
+int hardTurnDir = 0;  // 0=无, 1=右转(B001), -1=左转(B100)
 
 // ====================================================
 // 电机速度
@@ -214,8 +215,11 @@ void CalculateError() {
             break;
 
         case B000:  // 完全丢线
-            if(lastError < 0) {
-                error = -110;
+            if(abs(lastError) < 40) {
+                // 直道轻微丢线，温和纠偏，避免原地打转
+                error = (lastError < 0) ? -60 : 60;
+            } else if(lastError < 0) {
+                error = -110;  // 弯道丢线，强力纠偏
             } else {
                 error = 110;
             }
@@ -235,17 +239,62 @@ void CalculateError() {
 // ====================================================
 void PID_Control() {
     derivative = error - lastError;
+    derivative = constrain(derivative, -60, 60);  // 限制冲击，防止直道丢线时自转
 
     // ============================================
-    // 直角弯检测与状态锁存
+    // 直角弯检测与状态锁存（带方向记忆 + 退出冷却）
     // ============================================
-    bool isSharpTurn = (irSensors == B100 || irSensors == B001);
     bool isLostInTurn = (irSensors == B000 && abs(lastError) >= 80);
 
-    if(isSharpTurn) {
-        turningHard = true;  // 进入直角弯
-    } else if(irSensors == B010 || irSensors == B111) {
-        turningHard = false;  // 回到中线，退出直角弯
+    // 退出冷却：防止退出后立即再次进入导致震荡
+    static unsigned long cooldownUntil = 0;
+    bool inCooldown = (millis() < cooldownUntil);
+
+    if(!turningHard) {
+        // 不在直角弯中，检测是否进入（冷却期内禁止进入）
+        if(!inCooldown) {
+            if(irSensors == B100) {
+                turningHard = true;
+                hardTurnDir = -1;  // 左直角弯
+            } else if(irSensors == B001) {
+                turningHard = true;
+                hardTurnDir = 1;   // 右直角弯
+            }
+        }
+    } else {
+        // 已在直角弯中
+        bool exitTurn = false;
+        if(irSensors == B010 || irSensors == B011 || irSensors == B110 || irSensors == B111) {
+            // 中间传感器重新看到线，正常退出
+            exitTurn = true;
+        } else if((irSensors == B100 && hardTurnDir == 1) ||
+                  (irSensors == B001 && hardTurnDir == -1)) {
+            // 对侧传感器看到线 → 过弯完成，退出（防止反向误判）
+            exitTurn = true;
+        }
+
+        if(exitTurn) {
+            turningHard = false;
+            hardTurnDir = 0;
+            cooldownUntil = millis() + 300;  // 300ms冷却期
+        }
+        // 同向传感器或B000 → 保持当前方向和状态
+    }
+
+    // 直角弯超时保护：超过800ms强制退出，防止振荡打转
+    static unsigned long hardTurnStart = 0;
+    static bool hardTurnTimerRunning = false;
+    if(turningHard && !hardTurnTimerRunning) {
+        hardTurnStart = millis();
+        hardTurnTimerRunning = true;
+    }
+    if(!turningHard) {
+        hardTurnTimerRunning = false;
+    }
+    if(hardTurnTimerRunning && (millis() - hardTurnStart > 800)) {
+        turningHard = false;
+        hardTurnTimerRunning = false;
+        integral = 0;
     }
 
     bool useSharpPID = turningHard || isLostInTurn;
@@ -280,7 +329,7 @@ void PID_Control() {
         currentKp = Kp_sharp;
         currentKi = Ki_sharp;
         currentKd = Kd_sharp;
-        currentBaseSpeed = 35;
+        currentBaseSpeed = 45;
     } else {
         currentKp = Kp_normal;
         currentKi = Ki_normal;
@@ -316,9 +365,7 @@ void PID_Control() {
 void Drive(int leftSpeed, int rightSpeed) {
     // 右电机 (enablePin1, in1Pin, in2Pin)
     if(abs(rightSpeed) < deadband) {
-        // 刹车
-        digitalWrite(in1Pin, LOW);
-        digitalWrite(in2Pin, LOW);
+        // 滑行（断电，不刹车）
         analogWrite(enablePin1, 0);
     } else if(rightSpeed > 0) {
         // 正转
@@ -334,9 +381,7 @@ void Drive(int leftSpeed, int rightSpeed) {
 
     // 左电机 (enablePin2, in3Pin, in4Pin)
     if(abs(leftSpeed) < deadband) {
-        // 刹车
-        digitalWrite(in3Pin, LOW);
-        digitalWrite(in4Pin, LOW);
+        // 滑行（断电，不刹车）
         analogWrite(enablePin2, 0);
     } else if(leftSpeed > 0) {
         // 正转
