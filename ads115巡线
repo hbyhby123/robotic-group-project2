@@ -48,7 +48,7 @@ int irSensors = B000;
 基础速度
 ====================================================
 */
-int baseSpeed = 90;
+int baseSpeed = 70;
 
 /*
 ====================================================
@@ -258,11 +258,11 @@ void CalculateError()
 
             if(lastError < 0)
             {
-                error = -130;
+                error = -110;
             }
             else
             {
-                error = 130;
+                error = 110;
             }
 
             break;
@@ -307,7 +307,7 @@ void PID_Control()
 
     if(abs(error) >= 80)
     {
-        currentBaseSpeed = 75;
+        currentBaseSpeed = 45;
     }
     else
     {
