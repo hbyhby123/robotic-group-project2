@@ -26,7 +26,7 @@ const int in4Pin = 3;
 // ADS1115阈值
 // ====================================================
 const int thresholds[3] = {
-    15800,  // 左
+    15000,  // 左
     12500,  // 中（超前3cm）
     10900   // 右
 };
@@ -219,9 +219,9 @@ void Scan() {
                 Serial.print("ms ");
                 Serial.print(b000SearchDir > 0 ? "→" : "←");
             }
-        } else if(irSensors == B111 && consecutiveB111 <= 2) {
+        } else if((irSensors == B101 || irSensors == B111) && consecutiveB111 <= 2) {
             Serial.print(" | TRANS");
-        } else if(irSensors == B111) {
+        } else if(irSensors == B101 || irSensors == B111) {
             Serial.print(" | STRAIGHT");
         }
 
@@ -253,19 +253,18 @@ void CalculateError() {
         case B010:
         case B110:
         case B011:
-        case B101:
             // 使用连续ADC误差做精细转向
-            // B101: 中离线、两侧在线，减速由中间传感器=0时自动触发
             error = continuousError;
             break;
 
+        case B101:
         case B111:
-            // 短时B111 (≤2次) = 弯道过渡，维持lastError
-            // 长时B111  (>2次) = 直道，用连续ADC误差微调保持居中
+            // B101/B111: 短时(≤2次) = 弯道过渡，维持lastError
+            //            长时(>2次) = 直道，用连续ADC误差微调保持居中
             if(consecutiveB111 <= 2) {
                 error = (abs(lastError) < 40) ? continuousError : lastError;
             } else {
-                error = continuousError;  // 直道用ADC差值微调
+                error = continuousError;
             }
             break;
 
@@ -301,7 +300,8 @@ void CalculateError() {
 // PID控制（统一模式，无直角弯特殊处理）
 //
 // S弯策略:
-//   - B100/B001 由 PID 自然处理（不触发特殊模式）
+//   - B101/B111 合并处理，连续计数判断直道/弯道过渡
+//   - B100/B001 硬编码 pivot 转弯
 //   - B000 交替搜索，找回线后有冷却期防止再次丢线
 //   - 速度根据误差幅度自动调节
 // ====================================================
@@ -310,15 +310,15 @@ void PID_Control() {
     derivative = constrain(derivative, -30, 30);
 
     // ============================================
-    // B111 连续计数 + 直道稳定性修复
+    // B101/B111 连续计数 + 直道稳定性修复
     //
-    // 进入持续B111（直道）时:
+    // 进入持续B101/B111（直道）时:
     //   1. 清零 derivative，消除弯道→直道切换时的剧烈甩动
     //   2. 清零 integral，消除弯道残留积分导致的直道漂移
     // ============================================
-    if(irSensors == B111) {
+    if(irSensors == B101 || irSensors == B111) {
         consecutiveB111++;
-        // 刚进入持续直道（第3次B111）：清除弯道残留
+        // 刚进入持续直道（第3次B101/B111）：清除弯道残留
         if(consecutiveB111 == 3) {
             derivative = 0;
             integral = 0;
@@ -440,9 +440,8 @@ void PID_Control() {
     //       右轮刹停，左轮前进
     // B110: 左中在线、右离线 → 绕左轮左转
     //       左轮刹停，右轮前进
-    // B101: 中离线、两侧在线 → 减速至35，PID微调
-    // B001: 仅右在线 → 左轮30前进，右轮刹停 pivot
-    // B100: 仅左在线 → 右轮30前进，左轮刹停 pivot
+    // B001: 仅右在线 → 左轮前进，右轮刹停 pivot
+    // B100: 仅左在线 → 右轮前进，左轮刹停 pivot
     // ============================================
     if(irSensors == B011) {
         leftMotorSpeed  =  pivotSpeed;
@@ -450,14 +449,11 @@ void PID_Control() {
     } else if(irSensors == B110) {
         leftMotorSpeed  =  0;
         rightMotorSpeed =  pivotSpeed;
-    } else if(irSensors == B101) {
-        leftMotorSpeed  = constrain(35 + pid, -255, 255);
-        rightMotorSpeed = constrain(35 - pid, -255, 255);
     } else if(irSensors == B001) {
         leftMotorSpeed  = 80;
-        rightMotorSpeed = 0;
+        rightMotorSpeed = -70;
     } else if(irSensors == B100) {
-        leftMotorSpeed  = 0;
+        leftMotorSpeed  = -70;
         rightMotorSpeed = 80;
     }
 }
