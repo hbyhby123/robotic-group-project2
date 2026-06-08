@@ -26,9 +26,9 @@ const int in4Pin = 3;
 // ADS1115阈值
 // ====================================================
 const int thresholds[3] = {
-    11000,  // 左
-    13000,  // 中（超前3cm）
-    13000   // 右
+    15800,  // 左
+    12500,  // 中（超前3cm）
+    10900   // 右
 };
 
 // ====================================================
@@ -44,7 +44,7 @@ int rawLeft = 0, rawMid = 0, rawRight = 0;
 // 唯一速度参数 —— 直道巡航速度
 // S弯较多时建议 50-60
 // ====================================================
-const int baseSpeed = 55;
+const int baseSpeed = 85;
 
 // ====================================================
 // 直角弯单轮支点转弯速度
@@ -152,7 +152,7 @@ void setup() {
     Serial.print(" | Kp="); Serial.print(Kp);
     Serial.print(" Ki="); Serial.print(Ki);
     Serial.print(" Kd="); Serial.println(Kd);
-    Serial.println("模式: pivot(B011/B110/B100/B001) + B101减速");
+    Serial.println("模式: Kp=0.70 pivot转弯 + 中传感器=0减速");
     Serial.println("==========================================");
     #endif
 
@@ -253,18 +253,10 @@ void CalculateError() {
         case B010:
         case B110:
         case B011:
-            // 使用连续ADC误差做精细转向
-            error = continuousError;
-            break;
-
         case B101:
-            // 中离线、两侧在线 → 直角弯前兆
-            // ADC差值太小时沿用 lastError 方向，避免方向丢失
-            if(abs(continuousError) < 25) {
-                error = (lastError <= 0) ? -50 : 50;
-            } else {
-                error = continuousError;
-            }
+            // 使用连续ADC误差做精细转向
+            // B101: 中离线、两侧在线，减速由中间传感器=0时自动触发
+            error = continuousError;
             break;
 
         case B111:
@@ -279,12 +271,12 @@ void CalculateError() {
 
         case B100:
             // 仅左传感器在线 → 严重偏右，强力左转（pivot）
-            error = -110;
+            error = -95;
             break;
 
         case B001:
             // 仅右传感器在线 → 严重偏左，强力右转（pivot）
-            error = 110;
+            error = 95;
             break;
 
         case B000:
@@ -306,11 +298,12 @@ void CalculateError() {
 }
 
 // ====================================================
-// PID 控制 + 支点转弯 + B000搜索
+// PID控制（统一模式，无直角弯特殊处理）
 //
-// 支点转弯: B011/B110/B100/B001 绕单轮旋转
-// B101:     中间离线减速（限速35，为直角弯争取转向时间）
-// B000:     交替搜索，找回线后有冷却期防止再次丢线
+// S弯策略:
+//   - B100/B001 由 PID 自然处理（不触发特殊模式）
+//   - B000 交替搜索，找回线后有冷却期防止再次丢线
+//   - 速度根据误差幅度自动调节
 // ====================================================
 void PID_Control() {
     derivative = error - lastError;
@@ -396,8 +389,9 @@ void PID_Control() {
     // ============================================
     // 根据误差自动调整速度
     //
-    // B100/B001: 由下方支点转弯接管，不再依赖 PID
-    // B101:     由下方中间离线减速接管（限速35）
+    // B100/B001: error=±110 → 需要足够基础速度做 pivot
+    //   Kp=0.70, P项=77, baseSpeed=40 时:
+    //   外轮=117 内轮=-37 → 一轮反转支点转弯
     // ============================================
     int currentBaseSpeed;
     int absErr = abs(error);
@@ -413,18 +407,16 @@ void PID_Control() {
     }
 
     // ============================================
-    // B101 中间离线减速（直角弯/十字路口前兆）
+    // 中间传感器超前预警减速
     //
-    // 中间传感器超前3cm，B101 时它读到白，
-    // 说明前方黑线即将偏离或中断，提前减速
-    // 以争取更多转向时间。
+    // 中间传感器超前3cm，当它读到0（白）时说明
+    // 前方黑线即将偏离或中断，提前减速以争取
+    // 更多转向时间，使过弯更平滑。
     //
-    // B100/B001/B000 时中间离线是预期行为，
-    // 此时由支点转弯/搜索接管，不应减速。
+    // B000 时中间离线是预期丢线行为，
+    // 需要速度做交替搜索，不应减速。
     // ============================================
     if(irSensorDigital[1] == 0
-       && irSensors != B100
-       && irSensors != B001
        && irSensors != B000) {
         currentBaseSpeed = min(currentBaseSpeed, 35);
     }
@@ -442,12 +434,15 @@ void PID_Control() {
     rightMotorSpeed = constrain(currentBaseSpeed - pid, -255, 255);
 
     // ============================================
-    // 单轮支点转弯
+    // 硬编码转向速度覆盖
     //
-    // B011: 左离线、中右在线 → 绕右轮右转（右轮刹停，左轮前进）
-    // B110: 左中在线、右离线 → 绕左轮左转（左轮刹停，右轮前进）
-    // B100: 仅左在线 → 绕左轮左转（左轮刹停，右轮前进）
-    // B001: 仅右在线 → 绕右轮右转（右轮刹停，左轮前进）
+    // B011: 左离线、中右在线 → 绕右轮右转
+    //       右轮刹停，左轮前进
+    // B110: 左中在线、右离线 → 绕左轮左转
+    //       左轮刹停，右轮前进
+    // B101: 中离线、两侧在线 → 减速至35，PID微调
+    // B001: 仅右在线 → 左轮30前进，右轮刹停 pivot
+    // B100: 仅左在线 → 右轮30前进，左轮刹停 pivot
     // ============================================
     if(irSensors == B011) {
         leftMotorSpeed  =  pivotSpeed;
@@ -455,12 +450,15 @@ void PID_Control() {
     } else if(irSensors == B110) {
         leftMotorSpeed  =  0;
         rightMotorSpeed =  pivotSpeed;
-    } else if(irSensors == B100) {
-        leftMotorSpeed  =  0;
-        rightMotorSpeed =  pivotSpeed;
+    } else if(irSensors == B101) {
+        leftMotorSpeed  = constrain(35 + pid, -255, 255);
+        rightMotorSpeed = constrain(35 - pid, -255, 255);
     } else if(irSensors == B001) {
-        leftMotorSpeed  =  pivotSpeed;
-        rightMotorSpeed =  0;
+        leftMotorSpeed  = 80;
+        rightMotorSpeed = 0;
+    } else if(irSensors == B100) {
+        leftMotorSpeed  = 0;
+        rightMotorSpeed = 80;
     }
 }
 
