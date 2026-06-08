@@ -11,8 +11,8 @@ ADS1115_WE ads = ADS1115_WE(0x48);
 // ====================================================
 // 电机PWM引脚
 // ====================================================
-const int enablePin1 = 10;
-const int enablePin2 = 9;
+const int enablePin1 = 10;  // 右电机
+const int enablePin2 = 9;   // 左电机
 
 // ====================================================
 // 电机方向引脚
@@ -26,9 +26,9 @@ const int in4Pin = 3;
 // ADS1115阈值
 // ====================================================
 const int thresholds[3] = {
-    12700,  // 左: 白~6500 / 黑~18890
-    9785,   // 中: 白~1350 / 黑~18220
-    11255   // 右: 白~5260 / 黑~17250
+    13000,  // 左
+    10500,  // 中（超前3cm）
+    12000   // 右
 };
 
 // ====================================================
@@ -37,10 +37,14 @@ const int thresholds[3] = {
 int irSensorDigital[3];
 int irSensors = B000;
 
+// 原始ADC值（用于连续转向计算）
+int rawLeft = 0, rawMid = 0, rawRight = 0;
+
 // ====================================================
-// 基础速度
+// 唯一速度参数 —— 直道巡航速度
+// S弯较多时建议 50-60
 // ====================================================
-const int baseSpeed = 90;
+const int baseSpeed = 55;
 
 // ====================================================
 // 死区阈值
@@ -48,18 +52,22 @@ const int baseSpeed = 90;
 const int deadband = 8;
 
 // ====================================================
-// 正常模式PID参数
+// B000 交替搜索间隔 (ms)
 // ====================================================
-const float Kp_normal = 0.45;
-const float Ki_normal = 0.00;
-const float Kd_normal = 2.5;
+const unsigned long b000SweepInterval = 400;
 
 // ====================================================
-// 直角弯PID参数
+// B000 恢复后冷却期 (ms) —— 防止刚找回线又立即丢
 // ====================================================
-const float Kp_sharp = 0.25;
-const float Ki_sharp = 0.02;
-const float Kd_sharp = 1.5;
+const unsigned long b000RecoveryCooldown = 300;
+
+// ====================================================
+// 统一 PID 参数（不再区分正常/直角弯模式）
+// 稍高的 Ki 帮助 S 弯持续转向
+// ====================================================
+const float Kp = 0.50;
+const float Ki = 0.015;
+const float Kd = 2.5;
 
 // ====================================================
 // PID变量
@@ -71,10 +79,18 @@ float derivative = 0;
 float pid = 0;
 
 // ====================================================
-// 直角弯状态锁存
+// B111 连续计数
 // ====================================================
-bool turningHard = false;
-int hardTurnDir = 0;  // 0=无, 1=右转(B001), -1=左转(B100)
+int consecutiveB111 = 0;
+
+// ====================================================
+// B000 搜索状态
+// ====================================================
+bool b000Active = false;
+unsigned long b000StartTime = 0;
+unsigned long lastB000Sweep = 0;
+int b000SearchDir = 1;
+unsigned long b000RecoveryTime = 0;  // 恢复冷却时间戳
 
 // ====================================================
 // 电机速度
@@ -83,15 +99,14 @@ int leftMotorSpeed = 0;
 int rightMotorSpeed = 0;
 
 // ====================================================
-// 读取ADS1115通道（使用静态数组优化）
+// 读取ADS1115通道
 // ====================================================
 int readADS(byte ch) {
     static const ADS1115_MUX channels[3] = {
-        ADS1115_COMP_0_GND,  // 通道0
-        ADS1115_COMP_1_GND,  // 通道1
-        ADS1115_COMP_2_GND   // 通道2
+        ADS1115_COMP_0_GND,
+        ADS1115_COMP_1_GND,
+        ADS1115_COMP_2_GND
     };
-    
     ads.setCompareChannels(channels[ch]);
     ads.startSingleMeasurement();
     while(ads.isBusy()) {}
@@ -126,10 +141,15 @@ void setup() {
     ads.setConvRate(ADS1115_860_SPS);
 
     #ifdef DEBUG_SERIAL
-    Serial.println("ADS1115 READY");
+    Serial.println("=== ADS1115 READY (v4 统一PID / S弯优化) ===");
+    Serial.print("baseSpeed="); Serial.print(baseSpeed);
+    Serial.print(" | Kp="); Serial.print(Kp);
+    Serial.print(" Ki="); Serial.print(Ki);
+    Serial.print(" Kd="); Serial.println(Kd);
+    Serial.println("模式: 单-PID + B000交替搜索 + B111直行");
+    Serial.println("==========================================");
     #endif
 
-    // 初始化电机为刹车状态
     StopMotors();
 }
 
@@ -145,17 +165,21 @@ void loop() {
 
 // ====================================================
 // 扫描红外传感器
+//
+// 硬件布局（非对称，中间超前3cm）:
+//         [左]    [右]     ← 两侧（基准位置）
+//           \     /
+//            \   /
+//           [中间]         ← 中间（超前 ~3cm）
+//
+// 传感器位序: B[左][中][右]，1=黑线，0=白
 // ====================================================
 void Scan() {
     irSensors = B000;
 
-    // 传感器通道映射:
-    // ADS A2 ← 左传感器
-    // ADS A1 ← 中间传感器
-    // ADS A0 ← 右传感器
-    int rawLeft  = readADS(2);
-    int rawMid   = readADS(1);
-    int rawRight = readADS(0);
+    rawLeft  = readADS(2);
+    rawMid   = readADS(1);
+    rawRight = readADS(0);
 
     int raw[3] = {rawLeft, rawMid, rawRight};
 
@@ -164,216 +188,235 @@ void Scan() {
         irSensors |= (irSensorDigital[i] << (2 - i));
     }
 
-    // 定时输出调试信息（每80ms一次）
     #ifdef DEBUG_SERIAL
     static unsigned long lastPrint = 0;
-    if(millis() - lastPrint > 80) {
+    if(millis() - lastPrint > 100) {
         Serial.print("L=");
         Serial.print(rawLeft);
         Serial.print(" M=");
         Serial.print(rawMid);
         Serial.print(" R=");
         Serial.print(rawRight);
-        Serial.print(" S=B");
+        Serial.print(" | S=B");
         Serial.print(irSensors, BIN);
         Serial.print(" E=");
-        Serial.print(error);
-        Serial.print(" LSPD=");
+        Serial.print(error, 1);
+        Serial.print(" | Lm=");
         Serial.print(leftMotorSpeed);
-        Serial.print(" RSPD=");
+        Serial.print(" Rm=");
         Serial.print(rightMotorSpeed);
-        Serial.print(" T=");
-        Serial.println(turningHard ? "HARD" : "NORM");
+
+        if(irSensors == B000) {
+            Serial.print(" | LOST ");
+            if(b000Active) {
+                Serial.print(millis() - b000StartTime);
+                Serial.print("ms ");
+                Serial.print(b000SearchDir > 0 ? "→" : "←");
+            }
+        } else if(irSensors == B111 && consecutiveB111 <= 2) {
+            Serial.print(" | TRANS");
+        } else if(irSensors == B111) {
+            Serial.print(" | STRAIGHT");
+        }
+
+        Serial.println();
         lastPrint = millis();
     }
     #endif
 }
 
 // ====================================================
-// 状态转误差
+// 状态转误差（混合：连续ADC + 二进制状态）
+//
+// 核心改进: 在B111/B110/B011等状态下用原始ADC差值
+// 做连续转向，解决"全黑时无方向信息"的根本问题。
+//
+// rawRight > rawLeft → 线偏右 → 正值误差 → 右转
+// rawLeft > rawRight → 线偏左 → 负值误差 → 左转
+//
+// B100/B001 保留二进制强纠偏（极端情况）
+// B000 保留交替搜索
 // ====================================================
 void CalculateError() {
+    // 连续转向误差：基于左右传感器ADC原始差值
+    // divisor=180 将 ±15000 差值映射到约 ±83 误差范围
+    int continuousError = (rawRight - rawLeft) / 180;
+    continuousError = constrain(continuousError, -100, 100);
+
     switch(irSensors) {
-        case B010:  // 中间看到线
-            error = 0;
+        case B010:
+        case B110:
+        case B011:
+        case B101:
+            // 使用连续ADC误差做精细转向
+            error = continuousError;
             break;
 
-        case B110:  // 左+中看到线
-            error = -40;
-            break;
-
-        case B100:  // 仅左看到线
-            error = -80;
-            break;
-
-        case B011:  // 中+右看到线
-            error = 40;
-            break;
-
-        case B001:  // 仅右看到线
-            error = 80;
-            break;
-
-        case B000:  // 完全丢线
-            if(abs(lastError) < 40) {
-                // 直道轻微丢线，温和纠偏，避免原地打转
-                error = (lastError < 0) ? -60 : 60;
-            } else if(lastError < 0) {
-                error = -110;  // 弯道丢线，强力纠偏
+        case B111:
+            // 短时B111 (≤2次) = 弯道过渡，维持lastError
+            // 长时B111  (>2次) = 直道，用连续ADC误差微调保持居中
+            if(consecutiveB111 <= 2) {
+                error = (abs(lastError) < 40) ? continuousError : lastError;
             } else {
-                error = 110;
+                error = continuousError;  // 直道用ADC差值微调
             }
             break;
 
-        case B111:  // 全部看到线（十字路口等）
-            error = 0;
+        case B100:
+            // 仅左传感器在线 → 严重偏右，强力左转
+            error = -85;
+            break;
+
+        case B001:
+            // 仅右传感器在线 → 严重偏左，强力右转
+            error = 85;
+            break;
+
+        case B000:
+            // 丢线：使用交替搜索方向
+            if(b000Active) {
+                error = b000SearchDir * 110;
+            } else {
+                if(abs(lastError) < 40) {
+                    error = (lastError <= 0) ? -55 : 55;
+                } else {
+                    error = (lastError < 0) ? -110 : 110;
+                }
+            }
             break;
 
         default:
-            error = lastError;
+            error = continuousError;
     }
 }
 
 // ====================================================
-// PID控制
+// PID控制（统一模式，无直角弯特殊处理）
+//
+// S弯策略:
+//   - B100/B001 由 PID 自然处理（不触发特殊模式）
+//   - B000 交替搜索，找回线后有冷却期防止再次丢线
+//   - 速度根据误差幅度自动调节
 // ====================================================
 void PID_Control() {
     derivative = error - lastError;
-    derivative = constrain(derivative, -60, 60);  // 限制冲击，防止直道丢线时自转
+    derivative = constrain(derivative, -30, 30);
 
     // ============================================
-    // 直角弯检测与状态锁存（带方向记忆 + 退出冷却）
+    // B111 连续计数 + 直道稳定性修复
+    //
+    // 进入持续B111（直道）时:
+    //   1. 清零 derivative，消除弯道→直道切换时的剧烈甩动
+    //   2. 清零 integral，消除弯道残留积分导致的直道漂移
     // ============================================
-    bool isLostInTurn = (irSensors == B000 && abs(lastError) >= 80);
-
-    // 退出冷却：防止退出后立即再次进入导致震荡
-    static unsigned long cooldownUntil = 0;
-    bool inCooldown = (millis() < cooldownUntil);
-
-    if(!turningHard) {
-        // 不在直角弯中，检测是否进入（冷却期内禁止进入）
-        if(!inCooldown) {
-            if(irSensors == B100) {
-                turningHard = true;
-                hardTurnDir = -1;  // 左直角弯
-            } else if(irSensors == B001) {
-                turningHard = true;
-                hardTurnDir = 1;   // 右直角弯
-            }
+    if(irSensors == B111) {
+        consecutiveB111++;
+        // 刚进入持续直道（第3次B111）：清除弯道残留
+        if(consecutiveB111 == 3) {
+            derivative = 0;
+            integral = 0;
         }
     } else {
-        // 已在直角弯中
-        bool exitTurn = false;
-        if(irSensors == B010 || irSensors == B011 || irSensors == B110 || irSensors == B111) {
-            // 中间传感器重新看到线，正常退出
-            exitTurn = true;
-        } else if((irSensors == B100 && hardTurnDir == 1) ||
-                  (irSensors == B001 && hardTurnDir == -1)) {
-            // 对侧传感器看到线 → 过弯完成，退出（防止反向误判）
-            exitTurn = true;
+        consecutiveB111 = 0;
+    }
+
+    // ============================================
+    // B000 交替搜索 + 恢复冷却
+    // ============================================
+    bool inRecoveryCooldown = (millis() < b000RecoveryTime);
+
+    if(irSensors == B000) {
+        // 进入丢线状态
+        if(!b000Active && !inRecoveryCooldown) {
+            b000StartTime = millis();
+            b000Active = true;
+            lastB000Sweep = millis();
+            b000SearchDir = (lastError <= 0) ? -1 : 1;
+            integral = 0;  // 重置积分，避免历史值干扰搜索
+            #ifdef DEBUG_SERIAL
+            Serial.print(">>> B000 SEARCH START → ");
+            Serial.println(b000SearchDir > 0 ? "RIGHT" : "LEFT");
+            #endif
         }
 
-        if(exitTurn) {
-            turningHard = false;
-            hardTurnDir = 0;
-            cooldownUntil = millis() + 300;  // 300ms冷却期
+        // 定时反转搜索方向
+        if(b000Active && (millis() - lastB000Sweep > b000SweepInterval)) {
+            b000SearchDir = -b000SearchDir;
+            lastB000Sweep = millis();
+            #ifdef DEBUG_SERIAL
+            Serial.print(">>> B000 SWEEP REVERSE → ");
+            Serial.println(b000SearchDir > 0 ? "RIGHT" : "LEFT");
+            #endif
         }
-        // 同向传感器或B000 → 保持当前方向和状态
-    }
-
-    // 直角弯超时保护：超过800ms强制退出，防止振荡打转
-    static unsigned long hardTurnStart = 0;
-    static bool hardTurnTimerRunning = false;
-    if(turningHard && !hardTurnTimerRunning) {
-        hardTurnStart = millis();
-        hardTurnTimerRunning = true;
-    }
-    if(!turningHard) {
-        hardTurnTimerRunning = false;
-    }
-    if(hardTurnTimerRunning && (millis() - hardTurnStart > 800)) {
-        turningHard = false;
-        hardTurnTimerRunning = false;
-        integral = 0;
-    }
-
-    bool useSharpPID = turningHard || isLostInTurn;
-
-    // ============================================
-    // 模式切换时重置积分
-    // ============================================
-    static bool wasSharpLastLoop = false;
-    if(useSharpPID != wasSharpLastLoop) {
-        integral = 0;
-    }
-    wasSharpLastLoop = useSharpPID;
-
-    // ============================================
-    // 积分累加（仅在直角弯或小误差时）
-    // ============================================
-    if(useSharpPID || abs(error) < 60) {
-        integral += error;
     } else {
-        integral = 0;  // 大误差时清零积分，防止积分饱和
+        // 找回线了
+        if(b000Active) {
+            #ifdef DEBUG_SERIAL
+            Serial.print(">>> LINE FOUND! S=B");
+            Serial.print(irSensors, BIN);
+            Serial.println(" | cooldown 300ms");
+            #endif
+            b000RecoveryTime = millis() + b000RecoveryCooldown;
+            integral = 0;
+        }
+        b000Active = false;
     }
 
+    // ============================================
+    // 积分累加
+    // ============================================
+    // 始终累加积分以帮助持续转向（直角弯需要积分辅助）
+    // 仅在大误差跳变时减半积分，避免剧烈抖动
+    if(abs(derivative) > 40) {
+        integral *= 0.5;  // 状态跳变时减半积分
+    }
+    integral += error;
     integral = constrain(integral, -300, 300);
 
     // ============================================
-    // 选择PID参数与基础速度
+    // 根据误差自动调整速度
+    //
+    // 直角弯(B100/B001, E=±85)需要足够的基础速度才能产生
+    // 足够的轮速差来 pivot 转弯。速度太低会导致转向无力。
     // ============================================
-    float currentKp, currentKi, currentKd;
     int currentBaseSpeed;
+    int absErr = abs(error);
 
-    if(useSharpPID) {
-        currentKp = Kp_sharp;
-        currentKi = Ki_sharp;
-        currentKd = Kd_sharp;
-        currentBaseSpeed = 45;
+    if(absErr >= 110) {
+        currentBaseSpeed = 35;   // 丢线搜索（提高以加快找回线）
+    } else if(absErr >= 80) {
+        currentBaseSpeed = 50;   // 直角弯 / 严重偏离（不降太低，保证转向力）
+    } else if(absErr >= 40) {
+        currentBaseSpeed = 50;   // 一般弯道
     } else {
-        currentKp = Kp_normal;
-        currentKi = Ki_normal;
-        currentKd = Kd_normal;
-
-        // 根据误差调整基础速度
-        int absErr = abs(error);
-        if(absErr >= 110) {
-            currentBaseSpeed = 30;  // 完全丢线
-        } else if(absErr >= 40) {
-            currentBaseSpeed = 55;  // 一般弯道
-        } else {
-            currentBaseSpeed = baseSpeed;  // 直线
-        }
+        currentBaseSpeed = baseSpeed;  // 直道 55
     }
 
     // ============================================
-    // 计算PID输出
+    // PID计算
     // ============================================
-    pid = currentKp * error + currentKi * integral + currentKd * derivative;
+    pid = Kp * error + Ki * integral + Kd * derivative;
     lastError = error;
 
     // ============================================
     // 计算电机速度
     // ============================================
-    leftMotorSpeed = constrain(currentBaseSpeed + pid, -255, 255);
+    leftMotorSpeed  = constrain(currentBaseSpeed + pid, -255, 255);
     rightMotorSpeed = constrain(currentBaseSpeed - pid, -255, 255);
 }
 
 // ====================================================
-// 驱动电机（带死区与刹车）
+// 驱动电机
 // ====================================================
 void Drive(int leftSpeed, int rightSpeed) {
     // 右电机 (enablePin1, in1Pin, in2Pin)
     if(abs(rightSpeed) < deadband) {
-        // 滑行（断电，不刹车）
         analogWrite(enablePin1, 0);
     } else if(rightSpeed > 0) {
-        // 正转
         digitalWrite(in1Pin, HIGH);
         digitalWrite(in2Pin, LOW);
         analogWrite(enablePin1, rightSpeed);
     } else {
-        // 反转
         digitalWrite(in1Pin, LOW);
         digitalWrite(in2Pin, HIGH);
         analogWrite(enablePin1, -rightSpeed);
@@ -381,15 +424,12 @@ void Drive(int leftSpeed, int rightSpeed) {
 
     // 左电机 (enablePin2, in3Pin, in4Pin)
     if(abs(leftSpeed) < deadband) {
-        // 滑行（断电，不刹车）
         analogWrite(enablePin2, 0);
     } else if(leftSpeed > 0) {
-        // 正转
         digitalWrite(in3Pin, HIGH);
         digitalWrite(in4Pin, LOW);
         analogWrite(enablePin2, leftSpeed);
     } else {
-        // 反转
         digitalWrite(in3Pin, LOW);
         digitalWrite(in4Pin, HIGH);
         analogWrite(enablePin2, -leftSpeed);
