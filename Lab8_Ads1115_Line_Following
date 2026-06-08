@@ -450,11 +450,11 @@ void PID_Control() {
         leftMotorSpeed  =  0;
         rightMotorSpeed =  pivotSpeed;
     } else if(irSensors == B001) {
-        leftMotorSpeed  = 50;
-        rightMotorSpeed = -80;
+        leftMotorSpeed  = 55;
+        rightMotorSpeed = -90;
     } else if(irSensors == B100) {
-        leftMotorSpeed  = -80;
-        rightMotorSpeed =50;
+        leftMotorSpeed  = -90;
+        rightMotorSpeed =55;
     }
 }
 
