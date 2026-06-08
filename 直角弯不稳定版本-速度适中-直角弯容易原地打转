@@ -47,6 +47,12 @@ int rawLeft = 0, rawMid = 0, rawRight = 0;
 const int baseSpeed = 55;
 
 // ====================================================
+// 直角弯单轮支点转弯速度
+// B011/B110 时一轮刹停、另一轮以此速度前进
+// ====================================================
+const int pivotSpeed = 70;
+
+// ====================================================
 // 死区阈值
 // ====================================================
 const int deadband = 8;
@@ -65,7 +71,7 @@ const unsigned long b000RecoveryCooldown = 300;
 // 统一 PID 参数（不再区分正常/直角弯模式）
 // 稍高的 Ki 帮助 S 弯持续转向
 // ====================================================
-const float Kp = 0.50;
+const float Kp = 0.70;
 const float Ki = 0.015;
 const float Kd = 2.5;
 
@@ -141,12 +147,12 @@ void setup() {
     ads.setConvRate(ADS1115_860_SPS);
 
     #ifdef DEBUG_SERIAL
-    Serial.println("=== ADS1115 READY (v4 统一PID / S弯优化) ===");
+    Serial.println("=== ADS1115 READY (v5 直角弯强化) ===");
     Serial.print("baseSpeed="); Serial.print(baseSpeed);
     Serial.print(" | Kp="); Serial.print(Kp);
     Serial.print(" Ki="); Serial.print(Ki);
     Serial.print(" Kd="); Serial.println(Kd);
-    Serial.println("模式: 单-PID + B000交替搜索 + B111直行");
+    Serial.println("模式: Kp=0.70 pivot转弯 + B101方向保持");
     Serial.println("==========================================");
     #endif
 
@@ -239,17 +245,26 @@ void Scan() {
 // ====================================================
 void CalculateError() {
     // 连续转向误差：基于左右传感器ADC原始差值
-    // divisor=180 将 ±15000 差值映射到约 ±83 误差范围
-    int continuousError = (rawRight - rawLeft) / 180;
-    continuousError = constrain(continuousError, -100, 100);
+    // divisor=140 将 ±15000 差值映射到约 ±107 误差范围
+    int continuousError = (rawRight - rawLeft) / 140;
+    continuousError = constrain(continuousError, -110, 110);
 
     switch(irSensors) {
         case B010:
         case B110:
         case B011:
-        case B101:
             // 使用连续ADC误差做精细转向
             error = continuousError;
+            break;
+
+        case B101:
+            // 中离线、两侧在线 → 直角弯前兆
+            // ADC差值太小时沿用 lastError 方向，避免方向丢失
+            if(abs(continuousError) < 25) {
+                error = (lastError <= 0) ? -50 : 50;
+            } else {
+                error = continuousError;
+            }
             break;
 
         case B111:
@@ -263,13 +278,13 @@ void CalculateError() {
             break;
 
         case B100:
-            // 仅左传感器在线 → 严重偏右，强力左转
-            error = -85;
+            // 仅左传感器在线 → 严重偏右，强力左转（pivot）
+            error = -110;
             break;
 
         case B001:
-            // 仅右传感器在线 → 严重偏左，强力右转
-            error = 85;
+            // 仅右传感器在线 → 严重偏左，强力右转（pivot）
+            error = 110;
             break;
 
         case B000:
@@ -366,9 +381,15 @@ void PID_Control() {
     // 积分累加
     // ============================================
     // 始终累加积分以帮助持续转向（直角弯需要积分辅助）
-    // 仅在大误差跳变时减半积分，避免剧烈抖动
+    //
+    // 关键修复: error 正负变号说明机器人越过了中线，
+    // 旧方向的积分会拖累新方向，必须清零。
+    if((error > 0 && lastError < 0) || (error < 0 && lastError > 0)) {
+        integral = 0;
+    }
+    // 大误差跳变时减半积分，避免剧烈抖动
     if(abs(derivative) > 40) {
-        integral *= 0.5;  // 状态跳变时减半积分
+        integral *= 0.5;
     }
     integral += error;
     integral = constrain(integral, -300, 300);
@@ -376,20 +397,38 @@ void PID_Control() {
     // ============================================
     // 根据误差自动调整速度
     //
-    // 直角弯(B100/B001, E=±85)需要足够的基础速度才能产生
-    // 足够的轮速差来 pivot 转弯。速度太低会导致转向无力。
+    // B100/B001: error=±110 → 需要足够基础速度做 pivot
+    //   Kp=0.70, P项=77, baseSpeed=40 时:
+    //   外轮=117 内轮=-37 → 一轮反转支点转弯
     // ============================================
     int currentBaseSpeed;
     int absErr = abs(error);
 
     if(absErr >= 110) {
-        currentBaseSpeed = 35;   // 丢线搜索（提高以加快找回线）
+        currentBaseSpeed = 40;   // 直角弯 pivot / 丢线搜索
     } else if(absErr >= 80) {
-        currentBaseSpeed = 50;   // 直角弯 / 严重偏离（不降太低，保证转向力）
+        currentBaseSpeed = 50;   // 严重偏离
     } else if(absErr >= 40) {
         currentBaseSpeed = 50;   // 一般弯道
     } else {
         currentBaseSpeed = baseSpeed;  // 直道 55
+    }
+
+    // ============================================
+    // 中间传感器超前预警减速
+    //
+    // 中间传感器超前3cm，当它读到0（白）时说明
+    // 前方黑线即将偏离或中断，提前减速以争取
+    // 更多转向时间，使过弯更平滑。
+    //
+    // 但 B100/B001/B000 时中间离线是预期行为，
+    // 此时需要全力转向，不应减速。
+    // ============================================
+    if(irSensorDigital[1] == 0
+       && irSensors != B100
+       && irSensors != B001
+       && irSensors != B000) {
+        currentBaseSpeed = min(currentBaseSpeed, 35);
     }
 
     // ============================================
@@ -403,6 +442,22 @@ void PID_Control() {
     // ============================================
     leftMotorSpeed  = constrain(currentBaseSpeed + pid, -255, 255);
     rightMotorSpeed = constrain(currentBaseSpeed - pid, -255, 255);
+
+    // ============================================
+    // 直角弯单轮支点转弯
+    //
+    // B011: 左离线、中右在线 → 绕右轮右转
+    //       右轮刹停，左轮前进
+    // B110: 左中在线、右离线 → 绕左轮左转
+    //       左轮刹停，右轮前进
+    // ============================================
+    if(irSensors == B011) {
+        leftMotorSpeed  =  pivotSpeed;
+        rightMotorSpeed =  0;
+    } else if(irSensors == B110) {
+        leftMotorSpeed  =  0;
+        rightMotorSpeed =  pivotSpeed;
+    }
 }
 
 // ====================================================
