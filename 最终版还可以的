@@ -44,7 +44,7 @@ int rawLeft = 0, rawMid = 0, rawRight = 0;
 // 唯一速度参数 —— 直道巡航速度
 // S弯较多时建议 50-60
 // ====================================================
-const int baseSpeed = 85;
+const int baseSpeed = 90;
 
 // ====================================================
 // 直角弯单轮支点转弯速度
@@ -450,11 +450,11 @@ void PID_Control() {
         leftMotorSpeed  =  0;
         rightMotorSpeed =  pivotSpeed;
     } else if(irSensors == B001) {
-        leftMotorSpeed  = 80;
-        rightMotorSpeed = -100;
+        leftMotorSpeed  = 50;
+        rightMotorSpeed = -80;
     } else if(irSensors == B100) {
-        leftMotorSpeed  = -100;
-        rightMotorSpeed = 80;
+        leftMotorSpeed  = -80;
+        rightMotorSpeed =50;
     }
 }
 
