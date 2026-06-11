@@ -1,0 +1,615 @@
+#include <Wire.h>
+#include <ADS1115_WE.h>
+
+ADS1115_WE ads = ADS1115_WE(0x48);
+
+// ====================================================
+// 调试开关（注释掉关闭串口输出）
+// ====================================================
+#define DEBUG_SERIAL  // 启用调试输出
+
+// ====================================================
+// BMP280寄存器地址和配置（手动实现，避免使用整个Adafruit库）
+// ====================================================
+#define BMP280_ADDR 0x76
+#define BMP280_REG_TEMP_XLSB 0xFC
+#define BMP280_REG_TEMP_LSB 0xFB
+#define BMP280_REG_TEMP_MSB 0xFA
+#define BMP280_REG_PRESS_XLSB 0xF9
+#define BMP280_REG_PRESS_LSB 0xF8
+#define BMP280_REG_PRESS_MSB 0xF7
+#define BMP280_REG_CTRL_MEAS 0xF4
+#define BMP280_REG_CONFIG 0xF5
+#define BMP280_REG_DIG_T1 0x88
+
+// BMP280校准数据
+uint16_t dig_T1;
+int16_t dig_T2, dig_T3;
+uint16_t dig_P1;
+int16_t dig_P2, dig_P3, dig_P4, dig_P5, dig_P6, dig_P7, dig_P8, dig_P9;
+int32_t t_fine;
+
+// ====================================================
+// MPU-9250寄存器地址和配置（手动实现基础功能）
+// ====================================================
+#define MPU9250_ADDR 0x68
+#define MPU9250_ACCEL_XOUT_H 0x3B
+#define MPU9250_PWR_MGMT_1 0x6B
+#define MPU9250_ACCEL_CONFIG 0x1C
+#define MPU9250_GYRO_CONFIG 0x1B
+#define MPU9250_INT_PIN_CFG 0x37
+#define MPU9250_INT_ENABLE 0x38
+#define MPU9250_USER_CTRL 0x6A
+
+// ====================================================
+// 传感器更新计时
+// ====================================================
+unsigned long lastSensorUpdate = 0;
+const unsigned long sensorInterval = 1000;  // 改为1秒更新一次，避免过于频繁
+
+// ====================================================
+// MPU-9250 抬起/放下检测参数
+// ====================================================
+const float LIFT_THRESHOLD = 1.5;
+const float DROP_THRESHOLD = 0.3;
+bool isLifted = false;
+bool wasLifted = false;  // 记录上一次状态
+float lastAccelMagnitude = 1.0;
+
+// ====================================================
+// 电机PWM引脚
+// ====================================================
+const int enablePin1 = 10;
+const int enablePin2 = 9;
+
+// ====================================================
+// 电机方向引脚
+// ====================================================
+const int in1Pin = 4;
+const int in2Pin = 5;
+const int in3Pin = 2;
+const int in4Pin = 3;
+
+// ====================================================
+// ADS1115阈值
+// ====================================================
+const int thresholds[3] = {
+    14500, 15000, 10900
+};
+
+// ====================================================
+// 传感器状态
+// ====================================================
+int irSensorDigital[3];
+int irSensors = B000;
+int rawLeft = 0, rawMid = 0, rawRight = 0;
+
+// ====================================================
+// 速度参数
+// ====================================================
+const int baseSpeed = 90;
+const int pivotSpeed = 70;
+const int deadband = 8;
+
+// ====================================================
+// 搜索参数
+// ====================================================
+const unsigned long b000SweepInterval = 400;
+const unsigned long b000RecoveryCooldown = 300;
+
+// ====================================================
+// PID 参数
+// ====================================================
+const float Kp = 0.70;
+const float Ki = 0.015;
+const float Kd = 2.5;
+
+// ====================================================
+// PID变量
+// ====================================================
+float error = 0;
+float lastError = 0;
+float integral = 0;
+float derivative = 0;
+float pid = 0;
+
+// ====================================================
+// 状态变量
+// ====================================================
+int consecutiveB111 = 0;
+bool b000Active = false;
+unsigned long b000StartTime = 0;
+unsigned long lastB000Sweep = 0;
+int b000SearchDir = 1;
+unsigned long b000RecoveryTime = 0;
+int leftMotorSpeed = 0;
+int rightMotorSpeed = 0;
+
+// ====================================================
+// I2C读写辅助函数
+// ====================================================
+void i2cWriteByte(uint8_t addr, uint8_t reg, uint8_t data) {
+    Wire.beginTransmission(addr);
+    Wire.write(reg);
+    Wire.write(data);
+    Wire.endTransmission();
+}
+
+uint8_t i2cReadByte(uint8_t addr, uint8_t reg) {
+    Wire.beginTransmission(addr);
+    Wire.write(reg);
+    Wire.endTransmission(false);
+    Wire.requestFrom(addr, (uint8_t)1);
+    return Wire.read();
+}
+
+void i2cReadBytes(uint8_t addr, uint8_t reg, uint8_t* buf, uint8_t len) {
+    Wire.beginTransmission(addr);
+    Wire.write(reg);
+    Wire.endTransmission(false);
+    Wire.requestFrom(addr, len);
+    for(uint8_t i=0; i<len; i++) buf[i] = Wire.read();
+}
+
+// ====================================================
+// BMP280初始化
+// ====================================================
+bool initBMP280() {
+    // 读取校准数据
+    uint8_t calib[24];
+    i2cReadBytes(BMP280_ADDR, BMP280_REG_DIG_T1, calib, 24);
+    
+    dig_T1 = (calib[1]<<8) | calib[0];
+    dig_T2 = (calib[3]<<8) | calib[2];
+    dig_T3 = (calib[5]<<8) | calib[4];
+    dig_P1 = (calib[7]<<8) | calib[6];
+    dig_P2 = (calib[9]<<8) | calib[8];
+    dig_P3 = (calib[11]<<8) | calib[10];
+    dig_P4 = (calib[13]<<8) | calib[12];
+    dig_P5 = (calib[15]<<8) | calib[14];
+    dig_P6 = (calib[17]<<8) | calib[16];
+    dig_P7 = (calib[19]<<8) | calib[18];
+    dig_P8 = (calib[21]<<8) | calib[20];
+    dig_P9 = (calib[23]<<8) | calib[22];
+    
+    // 配置BMP280：正常模式，温度x1，压力x1
+    i2cWriteByte(BMP280_ADDR, BMP280_REG_CONFIG, 0x00);
+    i2cWriteByte(BMP280_ADDR, BMP280_REG_CTRL_MEAS, 0x27);
+    
+    return true;
+}
+
+// ====================================================
+// BMP280温度补偿计算
+// ====================================================
+float bmp280ReadTemperature() {
+    uint8_t data[3];
+    i2cReadBytes(BMP280_ADDR, BMP280_REG_TEMP_MSB, data, 3);
+    int32_t adc_T = ((int32_t)data[0]<<12) | ((int32_t)data[1]<<4) | (data[2]>>4);
+    
+    int32_t var1 = ((((adc_T>>3) - ((int32_t)dig_T1<<1))) * ((int32_t)dig_T2)) >> 11;
+    int32_t var2 = (((((adc_T>>4) - ((int32_t)dig_T1)) * ((adc_T>>4) - ((int32_t)dig_T1))) >> 12) * ((int32_t)dig_T3)) >> 14;
+    t_fine = var1 + var2;
+    
+    return (t_fine * 5 + 128) / 25600.0;
+}
+
+// ====================================================
+// BMP280气压补偿计算
+// ====================================================
+float bmp280ReadPressure() {
+    uint8_t data[3];
+    i2cReadBytes(BMP280_ADDR, BMP280_REG_PRESS_MSB, data, 3);
+    int32_t adc_P = ((int32_t)data[0]<<12) | ((int32_t)data[1]<<4) | (data[2]>>4);
+    
+    int64_t var1 = ((int64_t)t_fine) - 128000;
+    int64_t var2 = var1 * var1 * (int64_t)dig_P6;
+    var2 = var2 + ((var1*(int64_t)dig_P5)<<17);
+    var2 = var2 + (((int64_t)dig_P4)<<35);
+    var1 = ((var1 * var1 * (int64_t)dig_P3)>>8) + ((var1 * (int64_t)dig_P2)<<12);
+    var1 = (((((int64_t)1)<<47)+var1))*((int64_t)dig_P1)>>33;
+    
+    if (var1 == 0) return 0;
+    
+    int64_t p = 1048576 - adc_P;
+    p = (((p<<31) - var2)*3125) / var1;
+    var1 = (((int64_t)dig_P9) * (p>>13) * (p>>13)) >> 25;
+    var2 = (((int64_t)dig_P8) * p) >> 19;
+    p = ((p + var1 + var2) >> 8) + (((int64_t)dig_P7)<<4);
+    
+    return (float)p / 25600.0;
+}
+
+// ====================================================
+// MPU-9250初始化
+// ====================================================
+bool initMPU9250() {
+    // 唤醒MPU-9250
+    i2cWriteByte(MPU9250_ADDR, MPU9250_PWR_MGMT_1, 0x00);
+    delay(100);
+    
+    // 配置加速度计量程 ±2g
+    i2cWriteByte(MPU9250_ADDR, MPU9250_ACCEL_CONFIG, 0x00);
+    
+    // 配置陀螺仪量程 ±250°/s
+    i2cWriteByte(MPU9250_ADDR, MPU9250_GYRO_CONFIG, 0x00);
+    
+    // 启用I2C主模式以读取磁力计
+    i2cWriteByte(MPU9250_ADDR, MPU9250_USER_CTRL, 0x20);
+    i2cWriteByte(MPU9250_ADDR, MPU9250_INT_PIN_CFG, 0x02);
+    
+    return true;
+}
+
+// ====================================================
+// 读取MPU-9250加速度计数据
+// ====================================================
+void readMPU9250Accel(float &ax, float &ay, float &az) {
+    uint8_t data[6];
+    i2cReadBytes(MPU9250_ADDR, MPU9250_ACCEL_XOUT_H, data, 6);
+    
+    int16_t raw_ax = (data[0]<<8) | data[1];
+    int16_t raw_ay = (data[2]<<8) | data[3];
+    int16_t raw_az = (data[4]<<8) | data[5];
+    
+    // 转换为g (±2g量程)
+    ax = raw_ax / 16384.0;
+    ay = raw_ay / 16384.0;
+    az = raw_az / 16384.0;
+}
+
+// ====================================================
+// 读取MPU-9250陀螺仪数据
+// ====================================================
+void readMPU9250Gyro(float &gx, float &gy, float &gz) {
+    uint8_t data[6];
+    i2cReadBytes(MPU9250_ADDR, 0x43, data, 6);
+    
+    int16_t raw_gx = (data[0]<<8) | data[1];
+    int16_t raw_gy = (data[2]<<8) | data[3];
+    int16_t raw_gz = (data[4]<<8) | data[5];
+    
+    // 转换为°/s (±250°/s量程)
+    gx = raw_gx / 131.0;
+    gy = raw_gy / 131.0;
+    gz = raw_gz / 131.0;
+}
+
+// ====================================================
+// 读取并显示传感器数据
+// ====================================================
+void readSensors() {
+    // BMP280
+    float temp = bmp280ReadTemperature();
+    float press = bmp280ReadPressure();
+    
+    Serial.println("=== BMP280 传感器数据 ===");
+    Serial.print("温度：");
+    Serial.print(temp, 1);
+    Serial.print(" C, ");
+    Serial.print("气压：");
+    Serial.print(press, 1);
+    Serial.println(" hPa");
+    Serial.println("=========================");
+    
+    // MPU-9250
+    float ax, ay, az, gx, gy, gz;
+    readMPU9250Accel(ax, ay, az);
+    readMPU9250Gyro(gx, gy, gz);
+    
+    Serial.println("=== MPU-9250 传感器数据 ===");
+    Serial.print("加速度计: X=");
+    Serial.print(ax, 2);
+    Serial.print("g Y=");
+    Serial.print(ay, 2);
+    Serial.print("g Z=");
+    Serial.print(az, 2);
+    Serial.println("g");
+    Serial.print("陀螺仪: X=");
+    Serial.print(gx, 1);
+    Serial.print("d/s Y=");
+    Serial.print(gy, 1);
+    Serial.print("d/s Z=");
+    Serial.print(gz, 1);
+    Serial.println("d/s");
+    Serial.println("===========================");
+    
+    // 检测抬起/放下
+    float accelMag = sqrt(ax*ax + ay*ay + az*az);
+    float accelChange = abs(accelMag - lastAccelMagnitude);
+    
+    // 检测快速抬起
+    if (!isLifted && (accelChange > LIFT_THRESHOLD || accelMag > 1.8)) {
+        isLifted = true;
+        Serial.println("!!! 状态：机器人被快速抬起 - 车轮开始转动 !!!");
+    }
+    
+    // 检测快速放下
+    if (isLifted && accelMag < 1.1 && accelChange < DROP_THRESHOLD) {
+        isLifted = false;
+        Serial.println("!!! 状态：机器人被快速放下 - 车轮停止转动 !!!");
+    }
+    
+    lastAccelMagnitude = accelMag;
+}
+
+// ====================================================
+// 读取ADS1115通道
+// ====================================================
+int readADS(byte ch) {
+    static const ADS1115_MUX channels[3] = {
+        ADS1115_COMP_0_GND,
+        ADS1115_COMP_1_GND,
+        ADS1115_COMP_2_GND
+    };
+    ads.setCompareChannels(channels[ch]);
+    ads.startSingleMeasurement();
+    while(ads.isBusy()) {}
+    return ads.getRawResult();
+}
+
+// ====================================================
+// 初始化
+// ====================================================
+void setup() {
+    Serial.begin(9600);  // 使用9600波特率，避免乱码
+    delay(1000);  // 等待串口稳定
+    
+    Serial.println("========================================");
+    Serial.println("    机器人传感器系统初始化中...");
+    Serial.println("========================================");
+
+    pinMode(enablePin1, OUTPUT);
+    pinMode(enablePin2, OUTPUT);
+    pinMode(in1Pin, OUTPUT);
+    pinMode(in2Pin, OUTPUT);
+    pinMode(in3Pin, OUTPUT);
+    pinMode(in4Pin, OUTPUT);
+
+    Wire.begin();
+
+    if(!ads.init()) {
+        Serial.println("[错误] ADS1115 初始化失败");
+        while(1);
+    }
+
+    ads.setVoltageRange_mV(ADS1115_RANGE_6144);
+    ads.setConvRate(ADS1115_860_SPS);
+
+    // 初始化传感器
+    Serial.println("[信息] 正在初始化BMP280传感器...");
+    if(initBMP280()) {
+        Serial.println("[成功] BMP280 初始化完成");
+    } else {
+        Serial.println("[失败] BMP280 初始化失败");
+    }
+    
+    Serial.println("[信息] 正在初始化MPU-9250传感器...");
+    if(initMPU9250()) {
+        Serial.println("[成功] MPU-9250 初始化完成");
+    } else {
+        Serial.println("[失败] MPU-9250 初始化失败");
+    }
+
+    Serial.println("========================================");
+    Serial.println("    系统就绪，等待操作指令...");
+    Serial.println("========================================");
+
+    StopMotors();
+}
+
+// ====================================================
+// 主循环
+// ====================================================
+void loop() {
+    Scan();
+    CalculateError();
+    PID_Control();
+    
+    // 根据抬起/放下状态控制电机
+    if (isLifted) {
+        Drive(100, 100);  // 抬起时持续前进
+    } else {
+        Drive(0, 0);  // 放下时停止
+    }
+    
+    // 传感器更新
+    if (millis() - lastSensorUpdate >= sensorInterval) {
+        readSensors();
+        lastSensorUpdate = millis();
+    }
+}
+
+// ====================================================
+// 扫描红外传感器
+// ====================================================
+void Scan() {
+    irSensors = B000;
+
+    rawLeft  = readADS(2);
+    rawMid   = readADS(1);
+    rawRight = readADS(0);
+
+    int raw[3] = {rawLeft, rawMid, rawRight};
+
+    for(int i = 0; i < 3; i++) {
+        irSensorDigital[i] = (raw[i] >= thresholds[i]) ? 1 : 0;
+        irSensors |= (irSensorDigital[i] << (2 - i));
+    }
+}
+
+// ====================================================
+// 状态转误差
+// ====================================================
+void CalculateError() {
+    int continuousError = (rawRight - rawLeft) / 140;
+    continuousError = constrain(continuousError, -110, 110);
+
+    switch(irSensors) {
+        case B010:
+        case B110:
+        case B011:
+            error = continuousError;
+            break;
+
+        case B101:
+        case B111:
+            if(consecutiveB111 <= 2) {
+                error = (abs(lastError) < 40) ? continuousError : lastError;
+            } else {
+                error = continuousError;
+            }
+            break;
+
+        case B100:
+            error = -95;
+            break;
+
+        case B001:
+            error = 95;
+            break;
+
+        case B000:
+            if(b000Active) {
+                error = b000SearchDir * 110;
+            } else {
+                if(abs(lastError) < 40) {
+                    error = (lastError <= 0) ? -55 : 55;
+                } else {
+                    error = (lastError < 0) ? -110 : 110;
+                }
+            }
+            break;
+
+        default:
+            error = continuousError;
+    }
+}
+
+// ====================================================
+// PID控制
+// ====================================================
+void PID_Control() {
+    derivative = error - lastError;
+    derivative = constrain(derivative, -30, 30);
+
+    if(irSensors == B101 || irSensors == B111) {
+        consecutiveB111++;
+        if(consecutiveB111 == 3) {
+            derivative = 0;
+            integral = 0;
+        }
+    } else {
+        consecutiveB111 = 0;
+    }
+
+    bool inRecoveryCooldown = (millis() < b000RecoveryTime);
+
+    if(irSensors == B000) {
+        if(!b000Active && !inRecoveryCooldown) {
+            b000StartTime = millis();
+            b000Active = true;
+            lastB000Sweep = millis();
+            b000SearchDir = (lastError <= 0) ? -1 : 1;
+            integral = 0;
+        }
+
+        if(b000Active && (millis() - lastB000Sweep > b000SweepInterval)) {
+            b000SearchDir = -b000SearchDir;
+            lastB000Sweep = millis();
+        }
+    } else {
+        if(b000Active) {
+            b000RecoveryTime = millis() + b000RecoveryCooldown;
+            integral = 0;
+        }
+        b000Active = false;
+    }
+
+    if((error > 0 && lastError < 0) || (error < 0 && lastError > 0)) {
+        integral = 0;
+    }
+    if(abs(derivative) > 40) {
+        integral *= 0.5;
+    }
+    integral += error;
+    integral = constrain(integral, -300, 300);
+
+    int currentBaseSpeed;
+    int absErr = abs(error);
+
+    if(absErr >= 110) {
+        currentBaseSpeed = 40;
+    } else if(absErr >= 80) {
+        currentBaseSpeed = 50;
+    } else if(absErr >= 40) {
+        currentBaseSpeed = 50;
+    } else {
+        currentBaseSpeed = baseSpeed;
+    }
+
+    if(irSensorDigital[1] == 0 && irSensors != B000) {
+        currentBaseSpeed = min(currentBaseSpeed, 35);
+    }
+
+    pid = Kp * error + Ki * integral + Kd * derivative;
+    lastError = error;
+
+    leftMotorSpeed  = constrain(currentBaseSpeed + pid, -255, 255);
+    rightMotorSpeed = constrain(currentBaseSpeed - pid, -255, 255);
+
+    if(irSensors == B011) {
+        leftMotorSpeed  =  pivotSpeed;
+        rightMotorSpeed =  0;
+    } else if(irSensors == B110) {
+        leftMotorSpeed  =  0;
+        rightMotorSpeed =  pivotSpeed;
+    } else if(irSensors == B001) {
+        leftMotorSpeed  = 60;
+        rightMotorSpeed = -95;
+    } else if(irSensors == B100) {
+        leftMotorSpeed  = -95;
+        rightMotorSpeed = 60;
+    }
+}
+
+// ====================================================
+// 驱动电机
+// ====================================================
+void Drive(int leftSpeed, int rightSpeed) {
+    if(abs(rightSpeed) < deadband) {
+        analogWrite(enablePin1, 0);
+    } else if(rightSpeed > 0) {
+        digitalWrite(in1Pin, HIGH);
+        digitalWrite(in2Pin, LOW);
+        analogWrite(enablePin1, rightSpeed);
+    } else {
+        digitalWrite(in1Pin, LOW);
+        digitalWrite(in2Pin, HIGH);
+        analogWrite(enablePin1, -rightSpeed);
+    }
+
+    if(abs(leftSpeed) < deadband) {
+        analogWrite(enablePin2, 0);
+    } else if(leftSpeed > 0) {
+        digitalWrite(in3Pin, HIGH);
+        digitalWrite(in4Pin, LOW);
+        analogWrite(enablePin2, leftSpeed);
+    } else {
+        digitalWrite(in3Pin, LOW);
+        digitalWrite(in4Pin, HIGH);
+        analogWrite(enablePin2, -leftSpeed);
+    }
+}
+
+// ====================================================
+// 停止电机
+// ====================================================
+void StopMotors() {
+    digitalWrite(in1Pin, LOW);
+    digitalWrite(in2Pin, LOW);
+    digitalWrite(in3Pin, LOW);
+    digitalWrite(in4Pin, LOW);
+    analogWrite(enablePin1, 0);
+    analogWrite(enablePin2, 0);
+}
