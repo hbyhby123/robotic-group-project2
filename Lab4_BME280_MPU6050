@@ -13,11 +13,17 @@ Adafruit_BME280 bme;
 const int enA = 10, enB = 9;
 const int in1 = 4, in2 = 5, in3 = 2, in4 = 3;
 
+// ===== 模式枚举 =====
+enum CarState {
+    STATE_STATIONARY,   // 静止模式（车轮停转）
+    STATE_LIFTED,       // 抬升模式（车轮转动）
+    STATE_PUTDOWN       // 放下模式（车轮停转）
+};
+
 // ===== 全局状态变量 =====
 unsigned long lastDisp = 0;      // 上次显示时间
 unsigned long lastDet = 0;       // 上次检测时间
-bool lifted = false;             // 是否抬起状态
-float lastAcc = 1.0;             // 上一次加速度模值
+CarState state = STATE_STATIONARY;  // 初始为静止模式
 
 // ===== MPU6050 校准基准值 =====
 float accOffsetX = 0, accOffsetY = 0, accOffsetZ = 0;
@@ -28,10 +34,9 @@ float gyroFiltX = 0, gyroFiltY = 0, gyroFiltZ = 0;
 const float GYRO_ALPHA = 0.15;     // 低通系数（越小越平滑，越大越灵敏）
 const float GYRO_DEADBAND = 0.5;   // 死区阈值 °/s（低于此值归零）
 
-// ===== 防抖计数器 =====
-unsigned int liftCnt = 0;        // 连续满足抬起条件的次数
-unsigned int dropCnt = 0;        // 连续满足放下条件的次数
-const unsigned int CNT_NEEDED = 3;  // 需要连续几次才切换状态（约 3×66ms = 200ms）
+// ===== 切换冷却 =====
+unsigned long lastSwitch = 0;    // 上次状态切换的时间
+const unsigned int COOLDOWN_MS = 2000;  // 切换冷却时间（两次切换至少间隔 800ms）
 
 // ==========================================================
 //  MPU6050 底层读写函数
@@ -194,7 +199,7 @@ void setup() {
     Wire.begin();
 
     // 初始化 BME280
-    if (!bme.begi     a zn(0x76)) {
+    if (!bme.begin(0x76)) {
         Serial.println("BME280 初始化失败！");
         while (1);
     }
@@ -213,46 +218,50 @@ void setup() {
 //  loop()
 // ==========================================================
 void loop() {
-    // ----- 1. 抬升/放下检测（每 66ms 一次） -----
-    if (millis() - lastDet >= 66) {
+    // ----- 1. 模式检测（每 50ms 一次） -----
+    if (millis() - lastDet >= 50) {
         float ax, ay, az;
         readAcc(ax, ay, az);
-        float mag = sqrt(ax * ax + ay * ay + az * az);
-        float change = abs(mag - lastAcc);
 
-        // ===== 防抖逻辑 =====
-        if (!lifted) {
-            // 当前为放下状态，检测是否抬升
-            if (change > 1.5 || mag > 1.8) {
-                liftCnt++;
-                if (liftCnt >= CNT_NEEDED) {
-                    lifted = true;
-                    liftCnt = 0;
-                    Serial.println(">>> 机器人被快速抬起，车轮开始转动 <<<");
-                }
-            } else {
-                liftCnt = 0;   // 条件不满足，重置计数
-            }
-        } else {
-            // 当前为抬起状态，检测是否放下
-            if (mag < 1.1 && change < 0.3) {
-                dropCnt++;
-                if (dropCnt >= CNT_NEEDED) {
-                    lifted = false;
-                    dropCnt = 0;
-                    Serial.println(">>> 机器人被快速放下，车轮停止转动 <<<");
-                }
-            } else {
-                dropCnt = 0;
+        // ===== 冷却期内跳过检测 =====
+        if (millis() - lastSwitch >= COOLDOWN_MS) {
+
+            switch (state) {
+
+                case STATE_STATIONARY:
+                    // 静止模式：az > 1.4 则进入抬升模式
+                    if (az > 1.4) {
+                        state = STATE_LIFTED;
+                        lastSwitch = millis();
+                        Serial.println(">>> 检测到抬升，车轮开始转动 <<<");
+                    }
+                    break;
+
+                case STATE_LIFTED:
+                    // 抬升模式：az < 0.6 则进入放下模式
+                    if (az < 0.6) {
+                        state = STATE_PUTDOWN;
+                        lastSwitch = millis();
+                        Serial.println(">>> 检测到放下，车轮停止转动 <<<");
+                    }
+                    break;
+
+                case STATE_PUTDOWN:
+                    // 放下模式：az > 1.4 则再次进入抬升模式
+                    if (az > 1.4) {
+                        state = STATE_LIFTED;
+                        lastSwitch = millis();
+                        Serial.println(">>> 检测到抬升，车轮开始转动 <<<");
+                    }
+                    break;
             }
         }
 
-        lastAcc = mag;
         lastDet = millis();
     }
 
-    // ----- 2. 传感器数据显示（每 600ms 一次） -----
-    if (millis() - lastDisp >= 600) {
+    // ----- 2. 传感器数据显示（每 500ms 一次） -----
+    if (millis() - lastDisp >= 500) {
         float ax, ay, az, gx, gy, gz;
         readAcc(ax, ay, az);
         readGyro(gx, gy, gz);
@@ -287,6 +296,6 @@ void loop() {
         lastDisp = millis();
     }
 
-    // ----- 3. 根据 lifted 状态控制电机 -----
-    motor(lifted);
+    // ----- 3. 根据模式控制电机 -----
+    motor(state == STATE_LIFTED);
 }
