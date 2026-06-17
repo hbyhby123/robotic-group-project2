@@ -19,6 +19,15 @@ unsigned long lastDet = 0;       // 上次检测时间
 bool lifted = false;             // 是否抬起状态
 float lastAcc = 1.0;             // 上一次加速度模值
 
+// ===== MPU6050 校准基准值 =====
+float accOffsetX = 0, accOffsetY = 0, accOffsetZ = 0;
+float gyroOffsetX = 0, gyroOffsetY = 0, gyroOffsetZ = 0;
+
+// ===== 陀螺仪低通滤波状态 =====
+float gyroFiltX = 0, gyroFiltY = 0, gyroFiltZ = 0;
+const float GYRO_ALPHA = 0.15;     // 低通系数（越小越平滑，越大越灵敏）
+const float GYRO_DEADBAND = 0.5;   // 死区阈值 °/s（低于此值归零）
+
 // ===== 防抖计数器 =====
 unsigned int liftCnt = 0;        // 连续满足抬起条件的次数
 unsigned int dropCnt = 0;        // 连续满足放下条件的次数
@@ -57,7 +66,7 @@ void initMPU6050() {
     writeReg(MPU6050_ADDR, 0x1B, 0x00);
 }
 
-void readAcc(float &ax, float &ay, float &az) {
+void readAccRaw(float &ax, float &ay, float &az) {
     uint8_t d[6];
     readRegs(MPU6050_ADDR, 0x3B, d, 6);
     ax = ((int16_t)((d[0] << 8) | d[1])) / 16384.0;
@@ -65,12 +74,83 @@ void readAcc(float &ax, float &ay, float &az) {
     az = ((int16_t)((d[4] << 8) | d[5])) / 16384.0;
 }
 
-void readGyro(float &gx, float &gy, float &gz) {
+void readGyroRaw(float &gx, float &gy, float &gz) {
     uint8_t d[6];
     readRegs(MPU6050_ADDR, 0x43, d, 6);
     gx = ((int16_t)((d[0] << 8) | d[1])) / 131.0;
     gy = ((int16_t)((d[2] << 8) | d[3])) / 131.0;
     gz = ((int16_t)((d[4] << 8) | d[5])) / 131.0;
+}
+
+void readAcc(float &ax, float &ay, float &az) {
+    readAccRaw(ax, ay, az);
+    ax -= accOffsetX;
+    ay -= accOffsetY;
+    az -= accOffsetZ;
+}
+
+void readGyro(float &gx, float &gy, float &gz) {
+    float rawX, rawY, rawZ;
+    readGyroRaw(rawX, rawY, rawZ);
+
+    // 减去零偏
+    rawX -= gyroOffsetX;
+    rawY -= gyroOffsetY;
+    rawZ -= gyroOffsetZ;
+
+    // 一阶低通滤波（指数移动平均）
+    gyroFiltX = GYRO_ALPHA * rawX + (1.0 - GYRO_ALPHA) * gyroFiltX;
+    gyroFiltY = GYRO_ALPHA * rawY + (1.0 - GYRO_ALPHA) * gyroFiltY;
+    gyroFiltZ = GYRO_ALPHA * rawZ + (1.0 - GYRO_ALPHA) * gyroFiltZ;
+
+    // 死区滤波：低于阈值的微小抖动归零
+    gx = (abs(gyroFiltX) < GYRO_DEADBAND) ? 0.0 : gyroFiltX;
+    gy = (abs(gyroFiltY) < GYRO_DEADBAND) ? 0.0 : gyroFiltY;
+    gz = (abs(gyroFiltZ) < GYRO_DEADBAND) ? 0.0 : gyroFiltZ;
+}
+
+// ==========================================================
+//  MPU6050 基准值校准（需在静止状态下调用）
+// ==========================================================
+void calibrateMPU6050() {
+    const int samples = 200;
+    float sumAx = 0, sumAy = 0, sumAz = 0;
+    float sumGx = 0, sumGy = 0, sumGz = 0;
+
+    Serial.print("正在校准 MPU6050（采集 ");
+    Serial.print(samples);
+    Serial.println(" 个样本，请保持静止...）");
+
+    for (int i = 0; i < samples; i++) {
+        float ax, ay, az, gx, gy, gz;
+        readAccRaw(ax, ay, az);
+        readGyroRaw(gx, gy, gz);
+        sumAx += ax;
+        sumAy += ay;
+        sumAz += az;
+        sumGx += gx;
+        sumGy += gy;
+        sumGz += gz;
+        delay(5);
+    }
+
+    // 加速度计：静止时 X/Y 应为 0，Z 应为 1g
+    accOffsetX = sumAx / samples;          // X 偏移
+    accOffsetY = sumAy / samples;          // Y 偏移
+    accOffsetZ = sumAz / samples - 1.0;    // Z 偏移（减去重力 1g）
+
+    // 陀螺仪：静止时全部应为 0
+    gyroOffsetX = sumGx / samples;
+    gyroOffsetY = sumGy / samples;
+    gyroOffsetZ = sumGz / samples;
+
+    Serial.println("MPU6050 校准完成：");
+    Serial.print("  加速度计偏移: X=");  Serial.print(accOffsetX, 4);
+    Serial.print("  Y=");              Serial.print(accOffsetY, 4);
+    Serial.print("  Z=");              Serial.println(accOffsetZ, 4);
+    Serial.print("  陀螺仪偏移:   X=");  Serial.print(gyroOffsetX, 3);
+    Serial.print("  Y=");              Serial.print(gyroOffsetY, 3);
+    Serial.print("  Z=");              Serial.println(gyroOffsetZ, 3);
 }
 
 // ==========================================================
@@ -114,13 +194,16 @@ void setup() {
     Wire.begin();
 
     // 初始化 BME280
-    if (!bme.begin(0x76)) {
+    if (!bme.begi     a zn(0x76)) {
         Serial.println("BME280 初始化失败！");
         while (1);
     }
 
     // 初始化 MPU6050
     initMPU6050();
+
+    // 校准 MPU6050 基准值（此时请保持机器人静止放在平面上）
+    calibrateMPU6050();
 
     Serial.println("系统启动完成");
     motor(false);   // 确保初始电机停止
