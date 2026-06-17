@@ -6,17 +6,18 @@
 Adafruit_BME280 bme;
 #define SEALEVELPRESSURE_HPA (1013.25)
 
-// MPU-9250
-#define MPU9250_ADDR 0x68
+// MPU6050（兼容MPU9250的加速度计/陀螺仪部分）
+#define MPU6050_ADDR 0x68
 
-// 电机
+// 电机引脚
 const int enA = 10, enB = 9, in1 = 4, in2 = 5, in3 = 2, in4 = 3;
 
-// 状态
+// 状态变量
 unsigned long lastDisp = 0, lastDet = 0;
 bool lifted = false;
 float lastAcc = 1.0;
 
+// MPU6050 寄存器读写函数
 void writeReg(uint8_t addr, uint8_t reg, uint8_t val) {
     Wire.beginTransmission(addr); Wire.write(reg); Wire.write(val); Wire.endTransmission();
 }
@@ -27,22 +28,22 @@ void readRegs(uint8_t addr, uint8_t reg, uint8_t* buf, uint8_t len) {
 }
 
 void initMPU() {
-    writeReg(MPU9250_ADDR, 0x6B, 0x00); delay(100);
-    writeReg(MPU9250_ADDR, 0x1C, 0x00); writeReg(MPU9250_ADDR, 0x1B, 0x00);
+    writeReg(MPU6050_ADDR, 0x6B, 0x00); delay(100);
+    writeReg(MPU6050_ADDR, 0x1C, 0x00); writeReg(MPU6050_ADDR, 0x1B, 0x00);
 }
 
 void readAcc(float &ax, float &ay, float &az) {
-    uint8_t d[6]; readRegs(MPU9250_ADDR, 0x3B, d, 6);
-    ax = ((int16_t)((d[0]<<8)|d[1]))/16384.0;
-    ay = ((int16_t)((d[2]<<8)|d[3]))/16384.0;
-    az = ((int16_t)((d[4]<<8)|d[5]))/16384.0;
+    uint8_t d[6]; readRegs(MPU6050_ADDR, 0x3B, d, 6);
+    ax = ((int16_t)((d[0]<<8)|d[1])) / 16384.0;
+    ay = ((int16_t)((d[2]<<8)|d[3])) / 16384.0;
+    az = ((int16_t)((d[4]<<8)|d[5])) / 16384.0;
 }
 
 void readGyro(float &gx, float &gy, float &gz) {
-    uint8_t d[6]; readRegs(MPU9250_ADDR, 0x43, d, 6);
-    gx = ((int16_t)((d[0]<<8)|d[1]))/131.0;
-    gy = ((int16_t)((d[2]<<8)|d[3]))/131.0;
-    gz = ((int16_t)((d[4]<<8)|d[5]))/131.0;
+    uint8_t d[6]; readRegs(MPU6050_ADDR, 0x43, d, 6);
+    gx = ((int16_t)((d[0]<<8)|d[1])) / 131.0;
+    gy = ((int16_t)((d[2]<<8)|d[3])) / 131.0;
+    gz = ((int16_t)((d[4]<<8)|d[5])) / 131.0;
 }
 
 void motor(bool run) {
@@ -64,13 +65,11 @@ void setup() {
     
     Wire.begin();
     
-    // 初始化BME280
     if(!bme.begin(0x76)) {
         Serial.println("BME280初始化失败！");
         while(1);
     }
     
-    // 初始化MPU-9250
     initMPU();
     
     Serial.println("系统启动完成");
@@ -78,17 +77,17 @@ void setup() {
 }
 
 void loop() {
-    // 检测：每66ms一次
-    if(millis()-lastDet >= 66) {
+    // 检测：每30ms一次（原66ms，提高灵敏度）
+    if(millis() - lastDet >= 30) {   // <--- 修改点
         float ax, ay, az; readAcc(ax, ay, az);
-        float mag = sqrt(ax*ax+ay*ay+az*az);
-        float change = abs(mag-lastAcc);
+        float mag = sqrt(ax*ax + ay*ay + az*az);
+        float change = abs(mag - lastAcc);
         
-        if(!lifted && (change>1.5 || mag>1.8)) {
+        if(!lifted && (change > 1.5 || mag > 1.8)) {
             lifted = true;
             Serial.println(">>> 机器人被快速抬起，车轮开始转动 <<<");
         }
-        if(lifted && mag<1.1 && change<0.3) {
+        if(lifted && mag < 1.1 && change < 0.3) {
             lifted = false;
             Serial.println(">>> 机器人被快速放下，车轮停止转动 <<<");
         }
@@ -96,34 +95,41 @@ void loop() {
         lastDet = millis();
     }
     
-    // 显示：每600ms一次
-    if(millis()-lastDisp >= 600) {
+    // 显示：每600ms一次（保持不变）
+    if(millis() - lastDisp >= 600) {
         float ax, ay, az, gx, gy, gz;
-        readAcc(ax, ay, az); readGyro(gx, gy, gz);
+        readAcc(ax, ay, az);
+        readGyro(gx, gy, gz);
         
-        // BME280数据
+        float temp = bme.readTemperature();
+        float hum = bme.readHumidity();
+        float press = bme.readPressure() / 100.0;
+        float alt = bme.readAltitude(SEALEVELPRESSURE_HPA);
+        
         Serial.print("温度：");
-        Serial.print(bme.readTemperature(), 1);
-        Serial.print("°C，湿度：");
-        Serial.print(bme.readHumidity(), 1);
-        Serial.print("%，气压：");
-        Serial.print(bme.readPressure()/100.0, 1);
-        Serial.println(" hPa");
+        Serial.print(temp, 1);
+        Serial.print("°C  湿度：");
+        Serial.print(hum, 1);
+        Serial.print("%  气压：");
+        Serial.print(press, 1);
+        Serial.print(" hPa  海拔：");
+        Serial.print(alt, 1);
+        Serial.println(" m");
         
-        // MPU-9250数据
         Serial.print("加速度计：X=");
         Serial.print(ax, 2);
-        Serial.print("g，Y=");
+        Serial.print("g Y=");
         Serial.print(ay, 2);
-        Serial.print("g，Z=");
+        Serial.print("g Z=");
         Serial.print(az, 2);
         Serial.print("g | 陀螺仪：X=");
         Serial.print(gx, 1);
-        Serial.print("°/s，Y=");
+        Serial.print("°/s Y=");
         Serial.print(gy, 1);
-        Serial.print("°/s，Z=");
+        Serial.print("°/s Z=");
         Serial.print(gz, 1);
         Serial.println("°/s");
+        
         Serial.println("---");
         
         lastDisp = millis();
