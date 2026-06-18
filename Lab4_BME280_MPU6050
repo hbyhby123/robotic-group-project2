@@ -36,7 +36,7 @@ const float GYRO_DEADBAND = 0.5;   // 死区阈值 °/s（低于此值归零）
 
 // ===== 切换冷却 =====
 unsigned long lastSwitch = 0;    // 上次状态切换的时间
-const unsigned int COOLDOWN_MS = 2000;  // 切换冷却时间（两次切换至少间隔 800ms）
+const unsigned int COOLDOWN_MS = 2000;  // 切换冷却时间（两次切换至少间隔 2s）
 
 // ==========================================================
 //  MPU6050 底层读写函数
@@ -243,6 +243,10 @@ void loop() {
                         state = STATE_PUTDOWN;
                         lastSwitch = millis();
                         Serial.println(">>> 检测到放下，车轮停止转动 <<<");
+                    } else if (az > 1.4) {
+                        // 重新确认抬升模式，重置冷却计时器，防止抖动误触发
+                        lastSwitch = millis();
+                        Serial.println(">>> 确认抬升，维持转动 <<<");
                     }
                     break;
 
@@ -252,6 +256,10 @@ void loop() {
                         state = STATE_LIFTED;
                         lastSwitch = millis();
                         Serial.println(">>> 检测到抬升，车轮开始转动 <<<");
+                    } else if (az < 0.6) {
+                        // 重新确认放下模式，重置冷却计时器，防止抖动误触发
+                        lastSwitch = millis();
+                        Serial.println(">>> 确认放下，维持停止 <<<");
                     }
                     break;
             }
